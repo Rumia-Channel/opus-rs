@@ -39,6 +39,7 @@ pub mod shell_coder;
 pub mod sigm;
 pub mod sigproc_fix;
 pub mod sort;
+pub mod stereo_ms_to_lr;
 pub mod structs;
 pub mod tables;
 pub mod tables_nlsf;

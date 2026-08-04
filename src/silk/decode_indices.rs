@@ -1,6 +1,7 @@
 use crate::range_coder::RangeCoder;
 use crate::silk::decoder_structs::SilkDecoderState;
 use crate::silk::define::*;
+use crate::silk::macros::{silk_smlabb, silk_smulwb};
 use crate::silk::nlsf_unpack::silk_nlsf_unpack;
 use crate::silk::tables::*;
 
@@ -107,12 +108,34 @@ pub fn silk_decode_indices(
     ps_dec.indices.seed = ps_range_dec.decode_icdf(&SILK_UNIFORM4_ICDF, 8) as i8;
 }
 
-pub fn silk_stereo_decode_pred(ps_range_dec: &mut RangeCoder) {
-    ps_range_dec.decode_icdf(&SILK_STEREO_PRED_JOINT_ICDF, 8);
-    for _ in 0..2 {
-        ps_range_dec.decode_icdf(&SILK_UNIFORM3_ICDF, 8);
-        ps_range_dec.decode_icdf(&SILK_UNIFORM5_ICDF, 8);
+pub fn silk_stereo_decode_pred(ps_range_dec: &mut RangeCoder) -> [i32; 2] {
+    let mut pred_q13 = [0i32; 2];
+
+    // Entropy decoding
+    let n = ps_range_dec.decode_icdf(&SILK_STEREO_PRED_JOINT_ICDF, 8) as i32;
+    let mut ix = [[0i32; 3]; 2];
+    ix[0][2] = n / 5;
+    ix[1][2] = n - 5 * ix[0][2];
+    for i in 0..2 {
+        ix[i][0] = ps_range_dec.decode_icdf(&SILK_UNIFORM3_ICDF, 8) as i32;
+        ix[i][1] = ps_range_dec.decode_icdf(&SILK_UNIFORM5_ICDF, 8) as i32;
     }
+
+    // Dequantize
+    const STEREO_QUANT_SUB_STEPS: i32 = 5;
+    for i in 0..2 {
+        ix[i][0] += 3 * ix[i][2];
+        let low_q13 = SILK_STEREO_PRED_QUANT_Q13[ix[i][0] as usize] as i32;
+        let step_q13 = silk_smulwb(
+            SILK_STEREO_PRED_QUANT_Q13[(ix[i][0] + 1) as usize] as i32 - low_q13,
+            (1 << 16) / (2 * STEREO_QUANT_SUB_STEPS),
+        );
+        pred_q13[i] = silk_smlabb(low_q13, step_q13, 2 * ix[i][1] + 1);
+    }
+
+    // Subtract second from first predictor
+    pred_q13[0] -= pred_q13[1];
+    pred_q13
 }
 
 pub fn silk_stereo_decode_mid_only(ps_range_dec: &mut RangeCoder) -> bool {

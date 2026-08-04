@@ -2,7 +2,7 @@
 //!
 //! Each test mirrors the minimal reproducer from the corresponding issue.
 
-use opus_rs::OpusDecoder;
+use opus_rs::{Application, OpusDecoder, OpusEncoder};
 
 fn try_decode(label: &str, pkt: &[u8], frame_size: usize, channels: usize) {
     let mut dec = OpusDecoder::new(48000, channels).unwrap();
@@ -141,6 +141,92 @@ fn code1_even_length_accepted() {
     let mut pcm = vec![0.0f32; 1920];
     let res = dec.decode(&pkt, 1920, &mut pcm);
     assert!(res.is_ok(), "even-length code 1 should decode, got {res:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #7 sub-item 1: frame_size mismatch must return Err, not panic.
+// ---------------------------------------------------------------------------
+#[test]
+fn issue_7_frame_size_zero_no_panic() {
+    let pkt = [0xF8_u8, 0x00, 0x00, 0x00, 0x00]; // CELT 20ms mono
+    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut pcm = vec![];
+    let res = dec.decode(&pkt, 0, &mut pcm);
+    assert!(res.is_err(), "frame_size=0 should Err, got {res:?}");
+}
+
+#[test]
+fn issue_7_frame_size_too_small_no_panic() {
+    // Correct frame_size for CELT 20ms @ 48kHz mono is 960; pass 120.
+    let pkt = [0xF8_u8, 0x00, 0x00, 0x00, 0x00];
+    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut pcm = vec![0.0f32; 120];
+    let res = dec.decode(&pkt, 120, &mut pcm);
+    assert!(res.is_err(), "too-small frame_size should Err, got {res:?}");
+}
+
+#[test]
+fn issue_7_decode_returns_actual_sample_count() {
+    // CELT 20ms @ 48kHz mono → should return 960, not whatever frame_size was passed.
+    let pkt = [0xF8_u8, 0x00, 0x00, 0x00, 0x00];
+    let mut dec = OpusDecoder::new(48000, 1).unwrap();
+    let mut pcm = vec![0.0f32; 1920]; // pass double the needed size
+    let n = dec.decode(&pkt, 1920, &mut pcm).unwrap();
+    assert_eq!(n, 960, "should return actual decoded samples (960), got {n}");
+    // tail should be zero-filled
+    assert!(pcm[960..].iter().all(|&x| x == 0.0), "tail should be zero-filled");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #7 sub-item 3: Stereo SILK must decode M/S, not replicate mono.
+// ---------------------------------------------------------------------------
+#[test]
+fn issue_7_stereo_silk_channels_differ() {
+    let sr = 16000;
+    let ch = 2;
+    let fs = 320; // 20ms at 16kHz
+
+    let mut enc = OpusEncoder::new(sr, ch, Application::Voip).unwrap();
+    enc.bitrate_bps = 32000;
+
+    // Left = 440 Hz tone, Right = silence. Different per channel.
+    let mut pcm = vec![0.0f32; fs * ch];
+    for i in 0..fs {
+        let t = i as f64 / sr as f64;
+        let val = (440.0 * t * 2.0 * std::f64::consts::PI).sin() as f32 * 0.3;
+        pcm[i * 2] = val;      // L
+        pcm[i * 2 + 1] = 0.0;  // R (silence)
+    }
+
+    let mut packet = vec![0u8; 400];
+    let n = enc.encode(&pcm, fs, &mut packet).unwrap();
+
+    let mut dec = OpusDecoder::new(sr, ch).unwrap();
+    let mut out = vec![0.0f32; fs * ch];
+    let decoded = dec.decode(&packet[..n], fs, &mut out).unwrap();
+    assert_eq!(decoded, fs);
+
+    // Verify L and R are NOT identical (old code replicated mono → L==R).
+    let mut l_max = 0.0f32;
+    let mut r_max = 0.0f32;
+    for i in 0..fs {
+        l_max = l_max.max(out[i * 2].abs());
+        r_max = r_max.max(out[i * 2 + 1].abs());
+    }
+    // Left should have significant energy.
+    assert!(l_max > 0.01, "Left channel should have energy, got max={l_max}");
+    // Right should differ significantly from Left (not a mono copy).
+    // With M/S stereo and different L/R, R will not be zero but should be
+    // substantially different from L.
+    let mut l_minus_r = 0.0f32;
+    for i in 0..fs {
+        l_minus_r += (out[i * 2] - out[i * 2 + 1]).abs();
+    }
+    assert!(
+        l_minus_r / fs as f32 > 0.005,
+        "L and R should differ (M/S decoding), got avg diff={}",
+        l_minus_r / fs as f32
+    );
 }
 
 // helper used by the println-based debug tests

@@ -738,6 +738,9 @@ pub struct OpusDecoder {
     channels: usize,
 
     prev_mode: Option<OpusMode>,
+
+    /// Whether the previous frame had redundancy (mode transition marker).
+    prev_redundancy: bool,
     frame_size: usize,
 
     bandwidth: Bandwidth,
@@ -745,6 +748,9 @@ pub struct OpusDecoder {
     stream_channels: usize,
 
     silk_resampler: silk::resampler::SilkResampler,
+
+    /// Second resampler instance for stereo channel 1.
+    silk_resampler_2: silk::resampler::SilkResampler,
 
     prev_internal_rate: i32,
 
@@ -779,10 +785,12 @@ impl OpusDecoder {
             sampling_rate,
             channels,
             prev_mode: None,
+            prev_redundancy: false,
             frame_size: 0,
             bandwidth: Bandwidth::Auto,
             stream_channels: channels,
             silk_resampler: silk::resampler::SilkResampler::default(),
+            silk_resampler_2: silk::resampler::SilkResampler::default(),
             prev_internal_rate: 0,
             hybrid_skip_celt: false,
 
@@ -944,8 +952,44 @@ impl OpusDecoder {
         self.bandwidth = bandwidth;
         self.stream_channels = packet_channels;
 
-        let sub_frame_size = frame_size / frame_count;
+        // Derive the actual per-frame sample count from the TOC, not from the
+        // caller's frame_size. This prevents panics in bands.rs/celt.rs when
+        // the caller passes a mismatched frame_size (issue #7 sub-item 1):
+        // the internal decoders always get the correct geometry.
+        let toc_frame_size = frame_samples_from_toc(toc, self.sampling_rate)
+            .ok_or("Invalid TOC for sampling rate")?;
+        let decoded_total = toc_frame_size * frame_count;
+        if frame_size < decoded_total {
+            return Err("frame_size too small for packet");
+        }
+        if output.len() < decoded_total * self.channels {
+            return Err("Output buffer too small for packet");
+        }
+        // Zero-fill any extra space the caller provided beyond what the packet
+        // actually produces, so stale data is never left in the buffer.
+        if output.len() > decoded_total * self.channels {
+            for v in &mut output[decoded_total * self.channels..] {
+                *v = 0.0;
+            }
+        }
+        let sub_frame_size = toc_frame_size;
         let sub_output_len = sub_frame_size * self.channels;
+
+        // Detect mode transition and reset CELT decoder state to prevent
+        // cross-mode artifacts (libopus opus_decoder.c:602-604).
+        // This is the primary fix for issue #8/#9 alignment divergence:
+        // stale CELT MDCT/prefilter state at SILK↔CELT boundaries causes
+        // discontinuities that accumulate across transitions.
+        let mode_transition = match self.prev_mode {
+            Some(prev) if prev != mode && !self.prev_redundancy => true,
+            _ => false,
+        };
+        if mode_transition {
+            self.celt_dec.reset_state();
+        }
+
+        // Track whether this packet uses Hybrid redundancy.
+        let mut has_redundancy = false;
 
         match mode {
             OpusMode::SilkOnly => {
@@ -962,6 +1006,8 @@ impl OpusDecoder {
                     && internal_sample_rate != self.prev_internal_rate
                 {
                     self.silk_resampler
+                        .init(internal_sample_rate, self.sampling_rate);
+                    self.silk_resampler_2
                         .init(internal_sample_rate, self.sampling_rate);
                     self.prev_internal_rate = internal_sample_rate;
                 }
@@ -990,13 +1036,13 @@ impl OpusDecoder {
                     let decoded_samples = ret as usize;
                     let out_start = fi * sub_output_len;
 
-                    // SILK only decodes channel 0 (mono). For multi-channel output,
-                    // replicate the mono samples to every channel.
+                    // SILK decoder outputs planar: ch0 at [0..fl], ch1 at [fl..2*fl].
                     if self.sampling_rate == internal_sample_rate {
                         let frames = decoded_samples.min(sub_frame_size);
                         for i in 0..frames {
-                            let v = self.w_pcm_i16[i] as f32 / 32768.0;
                             for ch in 0..self.channels {
+                                let src = if ch == 0 { i } else { internal_frame_size + i };
+                                let v = self.w_pcm_i16[src] as f32 / 32768.0;
                                 let idx = out_start + i * self.channels + ch;
                                 if idx < output.len() {
                                     output[idx] = v;
@@ -1007,23 +1053,37 @@ impl OpusDecoder {
                         let ratio = self.sampling_rate as f64 / internal_sample_rate as f64;
                         let out_len =
                             ((decoded_samples as f64 * ratio) as usize).min(sub_frame_size);
-                        debug_assert!(out_len <= self.w_pcm_resampled.len());
+                        debug_assert!(out_len * self.channels <= self.w_pcm_resampled.len());
+                        // Resample channel 0.
                         {
-                            let (silk_res, pcm_i16, pcm_out) = (
+                            let (res, inp, out) = (
                                 &mut self.silk_resampler,
                                 &self.w_pcm_i16,
                                 &mut self.w_pcm_resampled,
                             );
-                            silk_res.process(
-                                &mut pcm_out[..out_len],
-                                &pcm_i16[..decoded_samples],
+                            res.process(
+                                &mut out[..out_len],
+                                &inp[..decoded_samples],
+                                decoded_samples as i32,
+                            );
+                        }
+                        // Resample channel 1 (stereo only).
+                        if self.channels == 2 {
+                            let (res, inp, out) = (
+                                &mut self.silk_resampler_2,
+                                &self.w_pcm_i16,
+                                &mut self.w_pcm_resampled,
+                            );
+                            res.process(
+                                &mut out[out_len..2 * out_len],
+                                &inp[internal_frame_size..internal_frame_size + decoded_samples],
                                 decoded_samples as i32,
                             );
                         }
                         let frames = out_len.min(sub_frame_size);
                         for i in 0..frames {
-                            let v = self.w_pcm_resampled[i] as f32 / 32768.0;
                             for ch in 0..self.channels {
+                                let v = self.w_pcm_resampled[ch * out_len + i] as f32 / 32768.0;
                                 let idx = out_start + i * self.channels + ch;
                                 if idx < output.len() {
                                     output[idx] = v;
@@ -1033,7 +1093,8 @@ impl OpusDecoder {
                     }
                 }
                 self.prev_mode = Some(OpusMode::SilkOnly);
-                Ok(frame_size)
+                self.prev_redundancy = has_redundancy;
+                Ok(decoded_total)
             }
 
             OpusMode::CeltOnly => {
@@ -1081,7 +1142,8 @@ impl OpusDecoder {
                     }
                 }
                 self.prev_mode = Some(OpusMode::CeltOnly);
-                Ok(frame_size)
+                self.prev_redundancy = has_redundancy;
+                Ok(decoded_total)
             }
 
             OpusMode::Hybrid => {
@@ -1094,6 +1156,8 @@ impl OpusDecoder {
                     && internal_sample_rate != self.prev_internal_rate
                 {
                     self.silk_resampler
+                        .init(internal_sample_rate, self.sampling_rate);
+                    self.silk_resampler_2
                         .init(internal_sample_rate, self.sampling_rate);
                     self.prev_internal_rate = internal_sample_rate;
                 }
@@ -1123,13 +1187,13 @@ impl OpusDecoder {
                     self.w_silk_out[..silk_out_len].fill(0.0);
                     if ret > 0 {
                         let decoded_samples = ret as usize;
-                        // SILK only decodes channel 0 (mono). For multi-channel output,
-                        // replicate the mono samples to every channel in w_silk_out.
+                        // SILK decoder outputs planar: ch0 at [0..fl], ch1 at [fl..2*fl].
                         if self.sampling_rate == internal_sample_rate {
                             let frames = decoded_samples.min(sub_frame_size);
                             for i in 0..frames {
-                                let v = self.w_pcm_i16[i] as f32 / 32768.0;
                                 for ch in 0..self.channels {
+                                    let src = if ch == 0 { i } else { internal_frame_size + i };
+                                    let v = self.w_pcm_i16[src] as f32 / 32768.0;
                                     let idx = i * self.channels + ch;
                                     if idx < silk_out_len {
                                         self.w_silk_out[idx] = v;
@@ -1140,23 +1204,37 @@ impl OpusDecoder {
                             let ratio = self.sampling_rate as f64 / internal_sample_rate as f64;
                             let out_len =
                                 ((decoded_samples as f64 * ratio) as usize).min(sub_frame_size);
-                            debug_assert!(out_len <= self.w_pcm_resampled.len());
+                            debug_assert!(out_len * self.channels <= self.w_pcm_resampled.len());
+                            // Resample channel 0.
                             {
-                                let (silk_res, pcm_i16, pcm_resampled) = (
+                                let (res, inp, out) = (
                                     &mut self.silk_resampler,
                                     &self.w_pcm_i16,
                                     &mut self.w_pcm_resampled,
                                 );
-                                silk_res.process(
-                                    &mut pcm_resampled[..out_len],
-                                    &pcm_i16[..decoded_samples],
+                                res.process(
+                                    &mut out[..out_len],
+                                    &inp[..decoded_samples],
+                                    decoded_samples as i32,
+                                );
+                            }
+                            // Resample channel 1 (stereo only).
+                            if self.channels == 2 {
+                                let (res, inp, out) = (
+                                    &mut self.silk_resampler_2,
+                                    &self.w_pcm_i16,
+                                    &mut self.w_pcm_resampled,
+                                );
+                                res.process(
+                                    &mut out[out_len..2 * out_len],
+                                    &inp[internal_frame_size..internal_frame_size + decoded_samples],
                                     decoded_samples as i32,
                                 );
                             }
                             let frames = out_len.min(sub_frame_size);
                             for i in 0..frames {
-                                let v = self.w_pcm_resampled[i] as f32 / 32768.0;
                                 for ch in 0..self.channels {
+                                    let v = self.w_pcm_resampled[ch * out_len + i] as f32 / 32768.0;
                                     let idx = i * self.channels + ch;
                                     if idx < silk_out_len {
                                         self.w_silk_out[idx] = v;
@@ -1168,10 +1246,18 @@ impl OpusDecoder {
 
                     let total_bits = (payload.len() * 8) as i32;
                     let redundancy = rc.decode_bit_logp(12);
+                    let celt_to_silk;
                     let skip_celt = if redundancy {
-                        let _ = rc.decode_bit_logp(1);
+                        celt_to_silk = rc.decode_bit_logp(1);
+                        has_redundancy = true;
+                        // When redundancy is present, the redundant CELT frame
+                        // provides the transition audio. We skip the main CELT
+                        // decode for this sub-frame (the SILK output stands alone)
+                        // — a simplified version of libopus's behaviour where the
+                        // redundant frame is decoded separately and crossfaded.
                         true
                     } else {
+                        celt_to_silk = false;
                         false
                     };
 
@@ -1209,7 +1295,8 @@ impl OpusDecoder {
                     }
                 }
                 self.prev_mode = Some(OpusMode::Hybrid);
-                Ok(frame_size)
+                self.prev_redundancy = has_redundancy;
+                Ok(decoded_total)
             }
         }
     }
@@ -1350,6 +1437,27 @@ fn frame_duration_ms_from_toc(toc: u8) -> i32 {
                 3 => 20,
                 _ => 20,
             }
+        }
+    }
+}
+
+/// Compute the per-frame sample count implied by the TOC byte at a given
+/// sampling rate. For CELT this uses the frame-rate derivation (which handles
+/// the 2.5 ms case correctly, unlike integer millisecond arithmetic).
+fn frame_samples_from_toc(toc: u8, sampling_rate: i32) -> Option<usize> {
+    let mode = mode_from_toc(toc);
+    match mode {
+        OpusMode::CeltOnly => {
+            let period = ((toc >> 3) & 0x03) as i32;
+            let frame_rate = 400 >> period;
+            if frame_rate == 0 || sampling_rate % frame_rate != 0 {
+                return None;
+            }
+            Some((sampling_rate / frame_rate) as usize)
+        }
+        OpusMode::SilkOnly | OpusMode::Hybrid => {
+            let duration_ms = frame_duration_ms_from_toc(toc);
+            Some((sampling_rate as i64 * duration_ms as i64 / 1000) as usize)
         }
     }
 }

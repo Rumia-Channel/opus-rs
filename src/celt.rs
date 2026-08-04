@@ -2401,6 +2401,24 @@ impl CeltDecoder {
         self.decode_impl(compressed, frame_size, pcm, 0, self.mode.nb_ebands)
     }
 
+    /// Reset all decoder state (equivalent to libopus `OPUS_RESET_STATE`).
+    /// Used at SILK↔CELT mode transitions to avoid cross-mode artifacts.
+    pub fn reset_state(&mut self) {
+        self.decode_mem.fill(0.0);
+        self.old_band_e.fill(0.0);
+        self.preemph_mem.fill(0.0);
+        self.prefilter_mem.fill(0.0);
+        self.prefilter_period = COMBFILTER_MINPERIOD;
+        self.prefilter_period_old = COMBFILTER_MINPERIOD;
+        self.prefilter_gain = 0.0;
+        self.prefilter_gain_old = 0.0;
+        self.prefilter_tapset = 0;
+        self.prefilter_tapset_old = 0;
+        self.old_band_e2.fill(0.0);
+        self.old_band_e3.fill(0.0);
+        self.rng = 0;
+    }
+
     pub fn decode_with_start_band(
         &mut self,
         compressed: &[u8],
