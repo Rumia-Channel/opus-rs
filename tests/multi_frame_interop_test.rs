@@ -18,6 +18,20 @@ fn rms(samples: &[f32]) -> f32 {
     (sum / samples.len() as f32).sqrt()
 }
 
+/// Encode a frame length per RFC 6716 §3.2.1 (same scheme as libopus):
+///   - `0..=251`: one byte
+///   - `252..`: two bytes where `length = second*4 + first`
+fn push_frame_size(out: &mut Vec<u8>, len: usize) {
+    if len < 252 {
+        out.push(len as u8);
+    } else {
+        let first = 252 + (len - 252) % 4;
+        let second = (len - first) / 4;
+        out.push(first as u8);
+        out.push(second as u8);
+    }
+}
+
 /// Encode one frame, return full packet bytes
 fn encode_full(encoder: &mut OpusEncoder, pcm: &[f32], frame_size: usize, buf_size: usize) -> Vec<u8> {
     let mut packet = vec![0u8; buf_size];
@@ -107,12 +121,7 @@ fn test_celt_multi_frame_code_2() {
     let toc2 = (pkt0[0] & 0xFC) | 0x02;
     let first_len = payload0.len();
     let mut c2 = vec![toc2];
-    if first_len < 128 {
-        c2.push(first_len as u8);
-    } else {
-        c2.push(0x80 | (first_len >> 8) as u8);
-        c2.push(first_len as u8);
-    }
+    push_frame_size(&mut c2, first_len);
     c2.extend_from_slice(payload0);
     c2.extend_from_slice(payload1);
 
@@ -189,13 +198,8 @@ fn test_celt_multi_frame_code_3_self_delimiting() {
     let toc3 = (pkt0[0] & 0xFC) | 0x03;
     let len0 = payload0.len();
     let mut c3 = vec![toc3];
-    c3.push(0x02);
-    if len0 < 128 {
-        c3.push(len0 as u8);
-    } else {
-        c3.push(0x80 | (len0 >> 8) as u8);
-        c3.push(len0 as u8);
-    }
+    c3.push(0x82); // V=1 (VBR), M=2
+    push_frame_size(&mut c3, len0);
     c3.extend_from_slice(payload0);
     c3.extend_from_slice(payload1);
 
@@ -298,12 +302,7 @@ fn test_multi_frame_code_2_unequal_payloads() {
     let toc2 = (pkt_sil[0] & 0xFC) | 0x02;
     let first_len = payload_sil.len();
     let mut c2 = vec![toc2];
-    if first_len < 128 {
-        c2.push(first_len as u8);
-    } else {
-        c2.push(0x80 | (first_len >> 8) as u8);
-        c2.push(first_len as u8);
-    }
+    push_frame_size(&mut c2, first_len);
     c2.extend_from_slice(payload_sil);
     c2.extend_from_slice(payload_tone);
 
@@ -353,12 +352,7 @@ fn test_multi_frame_all_codes_stereo() {
     // Code 2
     let first_len = payload0.len();
     let mut c2 = vec![base_toc | 0x02];
-    if first_len < 128 {
-        c2.push(first_len as u8);
-    } else {
-        c2.push(0x80 | (first_len >> 8) as u8);
-        c2.push(first_len as u8);
-    }
+    push_frame_size(&mut c2, first_len);
     c2.extend_from_slice(payload0);
     c2.extend_from_slice(payload1);
     let mut dec_mf = OpusDecoder::new(sr, ch).unwrap();
@@ -387,13 +381,8 @@ fn test_multi_frame_all_codes_stereo() {
     // Code 3 self-delimiting
     let len0 = payload0.len();
     let mut c3s = vec![base_toc | 0x03];
-    c3s.push(0x02);
-    if len0 < 128 {
-        c3s.push(len0 as u8);
-    } else {
-        c3s.push(0x80 | (len0 >> 8) as u8);
-        c3s.push(len0 as u8);
-    }
+    c3s.push(0x82); // V=1 (VBR), M=2
+    push_frame_size(&mut c3s, len0);
     c3s.extend_from_slice(payload0);
     c3s.extend_from_slice(payload1);
     let mut dec_mf = OpusDecoder::new(sr, ch).unwrap();
