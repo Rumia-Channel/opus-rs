@@ -1246,9 +1246,8 @@ impl OpusDecoder {
 
                     let total_bits = (payload.len() * 8) as i32;
                     let redundancy = rc.decode_bit_logp(12);
-                    let celt_to_silk;
                     let skip_celt = if redundancy {
-                        celt_to_silk = rc.decode_bit_logp(1);
+                        let _celt_to_silk = rc.decode_bit_logp(1);
                         has_redundancy = true;
                         // When redundancy is present, the redundant CELT frame
                         // provides the transition audio. We skip the main CELT
@@ -1257,7 +1256,6 @@ impl OpusDecoder {
                         // redundant frame is decoded separately and crossfaded.
                         true
                     } else {
-                        celt_to_silk = false;
                         false
                     };
 
