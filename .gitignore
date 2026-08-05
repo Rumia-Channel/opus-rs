@@ -7,3 +7,4 @@ fuzz/artifacts
 fuzz/corpus
 flamegraph.svg
 opus-1.6.1/tests/c_ref_gen
+tests/c_wav_ref

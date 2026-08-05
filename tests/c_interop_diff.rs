@@ -190,6 +190,15 @@ fn diff_celt_stereo() {
 }
 
 #[test]
+fn diff_celt_16k() {
+    if let Some(data) = load_ref("celt16k", 16000, 1) {
+        run_diff("CELT mono 16kHz (downsample=3)", &data);
+    } else {
+        eprintln!("skipping diff_celt_16k (no ref files)");
+    }
+}
+
+#[test]
 fn diff_hybrid_mono() {
     if let Some(data) = load_ref("hybrid_m", 48000, 1) {
         run_diff("Hybrid mono 48kHz", &data);
