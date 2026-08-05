@@ -26,7 +26,7 @@ fn test_celt_silence() {
     );
 
     // Decode silence packet
-    let mut decoder = CeltDecoder::new(mode, channels);
+    let mut decoder = CeltDecoder::new(mode, channels, 48000);
     let mut output = vec![0.0f32; frame_size];
     decoder.decode(&silence_packet, frame_size, &mut output);
 

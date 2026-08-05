@@ -10,6 +10,20 @@ use crate::quant_bands::{
 use crate::range_coder::RangeCoder;
 use crate::rate::{BITRES, clt_compute_allocation};
 
+/// CELT internal-to-API decimation factor (port of libopus `resampling_factor`).
+/// The CELT decoder always runs at 48 kHz internally; the output is decimated
+/// by this factor to reach the API sampling rate.
+fn resampling_factor(sampling_rate: i32) -> usize {
+    match sampling_rate {
+        48000 => 1,
+        24000 => 2,
+        16000 => 3,
+        12000 => 4,
+        8000 => 6,
+        _ => 1,
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
@@ -2330,6 +2344,9 @@ impl CeltEncoder {
 pub struct CeltDecoder {
     mode: &'static CeltMode,
     channels: usize,
+    /// Decimation factor for non-48kHz API rates (1=48k, 2=24k, 3=16k, 4=12k, 6=8k).
+    /// Mirrors libopus `CELTDecoder.downsample`.
+    downsample: usize,
     decode_mem: Vec<f32>,
     old_band_e: Vec<f32>,
     preemph_mem: Vec<f32>,
@@ -2359,7 +2376,10 @@ pub struct CeltDecoder {
 }
 
 impl CeltDecoder {
-    pub fn new(mode: &'static CeltMode, channels: usize) -> Self {
+    /// Create a CELT decoder. `sampling_rate` is the API sampling rate
+    /// (8000–48000); the decoder always operates at 48 kHz internally and
+    /// decimates by `resampling_factor(sampling_rate)` on output.
+    pub fn new(mode: &'static CeltMode, channels: usize, sampling_rate: i32) -> Self {
         let overlap = mode.overlap;
         let nb_ebands = mode.nb_ebands;
         let nb_x_ch = nb_ebands * channels;
@@ -2367,6 +2387,7 @@ impl CeltDecoder {
         Self {
             mode,
             channels,
+            downsample: resampling_factor(sampling_rate),
             decode_mem: vec![0.0; channels * (DECODE_BUFFER_SIZE + overlap)],
             old_band_e: vec![0.0; nb_x_ch],
             preemph_mem: vec![0.0; channels],
@@ -2487,6 +2508,12 @@ impl CeltDecoder {
         let end_band = end_band.min(nb_ebands).max(start_band);
         let overlap = mode.overlap;
 
+        // The API frame_size is in output samples. Internally CELT always
+        // decodes at 48 kHz, so upscale by the downsample factor (libopus
+        // celt_decoder.c:1196: `frame_size *= st->downsample`).
+        let api_frame_size = frame_size;
+        let frame_size = frame_size * self.downsample;
+
         let mut lm = 0;
         while (mode.short_mdct_size << lm) != frame_size {
             lm += 1;
@@ -2507,8 +2534,8 @@ impl CeltDecoder {
         }
 
         if silence {
-            pcm[..frame_size * channels].fill(0.0);
-            return frame_size;
+            pcm[..api_frame_size * channels].fill(0.0);
+            return api_frame_size;
         }
 
         let mut pf_on = false;
@@ -2759,6 +2786,17 @@ impl CeltDecoder {
             channels,
             (1 << lm) as usize,
         );
+        // Anti-aliasing: zero MDCT bins above the output Nyquist when
+        // downsampling (libopus denormalise_bands `if(downsample!=1)
+        // bound=IMIN(bound,N/downsample)`).
+        if self.downsample > 1 {
+            let bound = frame_size / self.downsample;
+            for c in 0..channels {
+                for i in bound..frame_size {
+                    freq[c * frame_size + i] = 0.0;
+                }
+            }
+        }
         // Always trace freq and band_amp for comparison
 
         let (shift, b) = if short_blocks {
@@ -2892,11 +2930,25 @@ impl CeltDecoder {
             let coef = mode.preemph[0];
             let mut m = self.preemph_mem[c];
             const VERY_SMALL: f32 = 1e-30f32;
-            for i in 0..frame_size {
-                let x = pcm_frame[i];
-                let val = (x + VERY_SMALL + m).clamp(-SIG_SAT, SIG_SAT);
-                pcm[c * frame_size + i] = val * (1.0 / 32768.0);
-                m = val * coef;
+            let ds = self.downsample;
+            if ds == 1 {
+                for i in 0..frame_size {
+                    let x = pcm_frame[i];
+                    let val = (x + VERY_SMALL + m).clamp(-SIG_SAT, SIG_SAT);
+                    pcm[c * api_frame_size + i] = val * (1.0 / 32768.0);
+                    m = val * coef;
+                }
+            } else {
+                // Run deemphasis IIR over all internal samples, but only write
+                // every downsample-th sample (libopus deemphasis() stride).
+                for i in 0..frame_size {
+                    let x = pcm_frame[i];
+                    let val = (x + VERY_SMALL + m).clamp(-SIG_SAT, SIG_SAT);
+                    if i % ds == 0 {
+                        pcm[c * api_frame_size + i / ds] = val * (1.0 / 32768.0);
+                    }
+                    m = val * coef;
+                }
             }
             self.preemph_mem[c] = m;
         }
@@ -2933,7 +2985,7 @@ impl CeltDecoder {
 
         self.rng = rc.rng;
 
-        frame_size
+        api_frame_size
     }
 }
 

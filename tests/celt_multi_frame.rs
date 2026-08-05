@@ -10,7 +10,7 @@ fn test_celt_multi_frame() {
 
     // Create encoder and decoder (reused across frames)
     let mut encoder = CeltEncoder::new(mode, channels);
-    let mut decoder = CeltDecoder::new(mode, channels);
+    let mut decoder = CeltDecoder::new(mode, channels, 48000);
 
     for frame in 0..5 {
         // Create sine wave for this frame

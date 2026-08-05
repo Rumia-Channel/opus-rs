@@ -42,7 +42,7 @@ fn test_celt_decode_from_range_coder() {
     let mode = default_mode();
     let frame_size = 960;
     let mut encoder = CeltEncoder::new(mode, 1);
-    let mut decoder = CeltDecoder::new(mode, 1);
+    let mut decoder = CeltDecoder::new(mode, 1, 48000);
 
     // Create a test signal
     let input: Vec<f32> = (0..frame_size)

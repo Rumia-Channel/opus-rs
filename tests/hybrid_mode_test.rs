@@ -225,7 +225,7 @@ fn test_celt_decode_with_start_band() {
     let frame_size = 960;
 
     let mut encoder = CeltEncoder::new(mode, 1);
-    let mut decoder = CeltDecoder::new(mode, 1);
+    let mut decoder = CeltDecoder::new(mode, 1, 48000);
 
     let mut input = vec![0.0f32; frame_size];
     for i in 0..frame_size {

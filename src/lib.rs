@@ -773,7 +773,7 @@ impl OpusDecoder {
         }
 
         let mode = modes::default_mode();
-        let celt_dec = CeltDecoder::new(mode, channels);
+        let celt_dec = CeltDecoder::new(mode, channels, sampling_rate);
 
         let mut silk_dec = silk::dec_api::SilkDecoder::new();
         silk_dec.init(sampling_rate.min(16000), channels as i32);

@@ -27,7 +27,7 @@ fn celt_loopback_160bytes() {
     let num_frames = 10;
 
     let mut encoder = CeltEncoder::new(mode, channels);
-    let mut decoder = CeltDecoder::new(mode, channels);
+    let mut decoder = CeltDecoder::new(mode, channels, 48000);
 
     let freq = 440.0;
     let mut all_in = vec![0.0f32; frame_size * num_frames];

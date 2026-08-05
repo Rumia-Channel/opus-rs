@@ -78,85 +78,65 @@ fn run_diff(label: &str, data: &RefData) {
         }
     }
 
-    // Skip warmup: first 3 frames (encoder/decoder pre-delay).
-    let warmup = 3 * data.frame_size * data.channels;
-    let rust_cmp = &rust_pcm[warmup.min(rust_pcm.len())..];
-    let ref_cmp = &data.ref_pcm[warmup.min(data.ref_pcm.len())..];
-    let n = rust_cmp.len().min(ref_cmp.len());
-    if n < 100 {
-        eprintln!("{}: too few samples after warmup ({})", label, n);
-        return;
-    }
+    // Per-frame SNR analysis: find best lag per frame, classify as exact/good/bad.
+    let n_frames = data.packets.len();
+    let fs_ch = data.frame_size * data.channels;
+    let mut n_exact = 0usize;
+    let mut n_good = 0usize;
+    let mut n_bad = 0usize;
+    let mut worst_snr = f64::MAX;
+    let mut worst_frame = 0usize;
 
-    // Try alignments to find best match (wide range for SILK pre-skip offset).
-    let mut best_snr = f64::MIN;
-    let mut best_lag = 0i32;
-    let max_lag = 30i32;
-    for lag in -max_lag..=max_lag {
-        let lag = lag as isize;
-        let (r_slice, f_slice): (&[f32], &[f32]) = if lag >= 0 {
-            let lag = lag as usize;
-            (&rust_cmp[lag..n], &ref_cmp[..n - lag])
-        } else {
-            let lag = (-lag) as usize;
-            (&rust_cmp[..n - lag], &ref_cmp[lag..n])
-        };
-        let m = r_slice.len().min(f_slice.len());
-        if m < 100 {
-            continue;
+    for f in 0..n_frames {
+        let r_start = f * fs_ch;
+        let ref_start = f * fs_ch;
+        if r_start + fs_ch > rust_pcm.len() || ref_start + fs_ch > data.ref_pcm.len() {
+            break;
         }
-        let mut energy_r = 0.0f64;
-        let mut energy_f = 0.0f64;
-        let mut err = 0.0f64;
-        for i in 0..m {
-            let r = r_slice[i] as f64;
-            let f = f_slice[i] as f64;
-            energy_r += r * r;
-            energy_f += f * f;
-            err += (r - f) * (r - f);
-        }
-        if energy_f > 0.0 && err > 0.0 {
-            let snr = 10.0 * (energy_f / err).log10();
-            if snr > best_snr {
-                best_snr = snr;
-                best_lag = lag as i32;
+        let r_frame = &rust_pcm[r_start..r_start + fs_ch];
+        let f_frame = &data.ref_pcm[ref_start..ref_start + fs_ch];
+
+        let mut best_snr = f64::MIN;
+        for lag in -30i32..=30i32 {
+            let lag = lag as isize;
+            let (rs, fs): (&[f32], &[f32]) = if lag >= 0 {
+                let l = lag as usize;
+                if l >= fs_ch { continue; }
+                (&r_frame[l..], &f_frame[..fs_ch - l])
+            } else {
+                let l = (-lag) as usize;
+                if l >= fs_ch { continue; }
+                (&r_frame[..fs_ch - l], &f_frame[l..])
+            };
+            let m = rs.len().min(fs.len());
+            if m < 10 { continue; }
+            let mut ef = 0.0f64; let mut err = 0.0f64;
+            for i in 0..m {
+                let r = rs[i] as f64; let f = fs[i] as f64;
+                ef += f * f; err += (r - f) * (r - f);
             }
-        } else if energy_f > 0.0 {
-            // Perfect match (err ≈ 0) — SNR is infinite.
-            best_snr = 999.0;
-            best_lag = lag as i32;
+            if ef > 0.0 {
+                let snr = if err > 1e-30 { 10.0 * (ef / err).log10() } else { 999.0 };
+                if snr > best_snr { best_snr = snr; }
+            }
+        }
+
+        if best_snr > 100.0 {
+            n_exact += 1;
+        } else if best_snr > 40.0 {
+            n_good += 1;
+        } else {
+            n_bad += 1;
+            if best_snr < worst_snr {
+                worst_snr = best_snr;
+                worst_frame = f;
+            }
         }
     }
-
-    // Compute correlation at best lag.
-    let corr = {
-        let lag = best_lag as isize;
-        let (r_slice, f_slice): (&[f32], &[f32]) = if lag >= 0 {
-            let lag = lag as usize;
-            (&rust_cmp[lag..n], &ref_cmp[..n - lag])
-        } else {
-            let lag = (-lag) as usize;
-            (&rust_cmp[..n - lag], &ref_cmp[lag..n])
-        };
-        let m = r_slice.len().min(f_slice.len());
-        let mut dot = 0.0f64;
-        let mut er = 0.0f64;
-        let mut ef = 0.0f64;
-        for i in 0..m {
-            dot += r_slice[i] as f64 * f_slice[i] as f64;
-            er += (r_slice[i] as f64).powi(2);
-            ef += (f_slice[i] as f64).powi(2);
-        }
-        if er > 0.0 && ef > 0.0 {
-            dot / (er.sqrt() * ef.sqrt())
-        } else {
-            0.0
-        }
-    };
 
     println!(
-        "{}: cmp_samples={} corr={:.6} best_snr={:.1}dB @lag={}",
-        label, n, corr, best_snr, best_lag
+        "{}: {} frames — exact(>100dB):{}, good(>40dB):{}, bad(<40dB):{} | worst: frame {} @ {:.1}dB",
+        label, n_frames, n_exact, n_good, n_bad, worst_frame, worst_snr
     );
 }
 

@@ -10,7 +10,7 @@ fn test_celt_loopback() {
     // let overlap = mode.overlap;
 
     let mut encoder = CeltEncoder::new(mode, channels);
-    let mut decoder = CeltDecoder::new(mode, channels);
+    let mut decoder = CeltDecoder::new(mode, channels, 48000);
 
     let nb_frames = 12;
     let mut all_in = Vec::new();

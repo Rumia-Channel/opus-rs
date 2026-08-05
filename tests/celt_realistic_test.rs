@@ -12,7 +12,7 @@ fn test_celt_realistic_bitrate() {
     let budget = 160; // Same as OpusEncoder @ 64kbps
 
     let mut encoder = CeltEncoder::new(mode, channels);
-    let mut decoder = CeltDecoder::new(mode, channels);
+    let mut decoder = CeltDecoder::new(mode, channels, 48000);
 
     let freq = 440.0;
     let num_frames = 10;
