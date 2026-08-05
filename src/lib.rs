@@ -805,7 +805,7 @@ impl OpusDecoder {
             w_celt_planar: vec![0.0f32; 5760 * channels],
             w_celt_out: vec![0.0f32; 5760 * channels],
 
-            prev_pcm_tail: vec![0.0f32; 120 * channels],
+            prev_pcm_tail: vec![0.0f32; 240 * channels],
         })
     }
 
@@ -992,6 +992,69 @@ impl OpusDecoder {
         };
         if mode_transition {
             self.celt_dec.reset_state();
+        }
+
+        // Generate SILK PLC audio for the mode-transition bridge. libopus
+        // synthesizes 5ms (F5) of pitch-extrapolated audio in the OLD mode
+        // (opus_decoder.c:387-391) and crossfades it with the new frame. We
+        // reuse the F5-sized prev_pcm_tail buffer for this bridge.
+        let f5_bridge = self.sampling_rate as usize / 200; // F5 = Fs/200
+        if mode_transition
+            && f5_bridge > 0
+            && matches!(
+                self.prev_mode,
+                Some(OpusMode::SilkOnly) | Some(OpusMode::Hybrid)
+            )
+            && self.prev_internal_rate > 0
+        {
+            let internal_rate = self.prev_internal_rate;
+            let plc_internal_len = (10 * internal_rate / 1000) as usize;
+            let mut plc_rc = RangeCoder::new_decoder(&[]);
+            let mut plc_i16 = vec![0i16; plc_internal_len * self.channels];
+            let n = self.silk_dec.decode(
+                &mut plc_rc,
+                &mut plc_i16,
+                silk::decode_frame::FLAG_PACKET_LOST,
+                true,
+                10,
+                internal_rate,
+            );
+            if n > 0 {
+                let bridge_ch = f5_bridge * self.channels;
+                let bridge_len = bridge_ch.min(self.prev_pcm_tail.len());
+                if internal_rate == self.sampling_rate {
+                    // No resampling: copy PLC samples directly (ch0 planar).
+                    let n_us = n as usize;
+                    for ch in 0..self.channels {
+                        let src_base = ch * n_us;
+                        for i in 0..(bridge_len / self.channels).min(n_us) {
+                            let dst = i * self.channels + ch;
+                            if dst < bridge_len {
+                                self.prev_pcm_tail[dst] = plc_i16[src_base + i] as f32 / 32768.0;
+                            }
+                        }
+                    }
+                } else if self.silk_resampler.is_initialized() {
+                    // Resample channel 0 to the API rate for the bridge.
+                    let ratio = self.sampling_rate as f64 / internal_rate as f64;
+                    let out_len = ((n as f64 * ratio) as usize).min(f5_bridge);
+                    let n_us = n as usize;
+                    let mut resampled = vec![0i16; out_len];
+                    self.silk_resampler.process(
+                        &mut resampled,
+                        &plc_i16[..n_us],
+                        n,
+                    );
+                    for i in 0..out_len {
+                        if i < bridge_len / self.channels {
+                            for ch in 0..self.channels {
+                                self.prev_pcm_tail[i * self.channels + ch] =
+                                    resampled[i] as f32 / 32768.0;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Track whether this packet uses Hybrid redundancy.
@@ -1298,21 +1361,26 @@ impl OpusDecoder {
             }
         };
 
-        // Apply smooth_fade crossfade at mode transitions (libopus
-        // opus_decoder.c:660-679). This blends the last F2_5 samples of the
-        // previous frame with the first F2_5 samples of the new frame,
-        // smoothing the discontinuity at SILK↔CELT boundaries (#8/#9).
+        // Apply PLC-style bridging at mode transitions (libopus
+        // opus_decoder.c:660-679). The first F2_5 of the output is replaced
+        // with the previous frame's tail (PLC bridge), and the next F2_5 is
+        // crossfaded between the bridge and the new frame's CELT output.
+        // F5 = Fs/200, F2_5 = Fs/400.
         let f2_5 = self.sampling_rate as usize / 400;
-        if mode_transition && f2_5 > 0 && decoded_total >= f2_5 {
+        let f5 = f2_5 * 2;
+        if mode_transition && f5 > 0 && decoded_total >= f5 {
             let window = modes::default_mode().window;
             let inc = (48000 / self.sampling_rate) as usize;
-            let fade_samples = f2_5 * self.channels;
-            // Save new frame's head for the crossfade (it gets overwritten).
-            let new_head: Vec<f32> = output[..fade_samples].to_vec();
+            let f2_5_ch = f2_5 * self.channels;
+            let f5_ch = f5 * self.channels;
+            // First F2_5: pure bridging audio from previous frame's tail.
+            output[..f2_5_ch].copy_from_slice(&self.prev_pcm_tail[..f2_5_ch]);
+            // Next F2_5: crossfade bridge → new CELT output.
+            let new_mid: Vec<f32> = output[f2_5_ch..f5_ch].to_vec();
             smooth_fade(
-                &self.prev_pcm_tail[..fade_samples],
-                &new_head,
-                &mut output[..fade_samples],
+                &self.prev_pcm_tail[f2_5_ch..f5_ch],
+                &new_mid,
+                &mut output[f2_5_ch..f5_ch],
                 f2_5,
                 self.channels,
                 window,
@@ -1320,8 +1388,8 @@ impl OpusDecoder {
             );
         }
 
-        // Save the tail of this frame for the next transition.
-        let tail_len = f2_5 * self.channels;
+        // Save the tail of this frame for the next transition (F5 samples).
+        let tail_len = f5 * self.channels;
         let out_total = decoded_total * self.channels;
         if out_total >= tail_len && tail_len <= self.prev_pcm_tail.len() {
             self.prev_pcm_tail[..tail_len]

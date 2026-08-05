@@ -5,6 +5,7 @@ use crate::silk::decode_parameters::silk_decode_parameters;
 use crate::silk::decode_pulses::silk_decode_pulses;
 use crate::silk::decoder_structs::{SilkDecoderControl, SilkDecoderState};
 use crate::silk::define::*;
+use crate::silk::plc::{silk_plc, silk_plc_glue_frames};
 
 pub const FLAG_DECODE_NORMAL: i32 = 0;
 pub const FLAG_PACKET_LOST: i32 = 1;
@@ -54,21 +55,24 @@ pub fn silk_decode_frame(
         ps_dec.out_buf.rotate_left(ps_dec.frame_length as usize);
         ps_dec.out_buf[mv_len as usize..mv_len as usize + l].copy_from_slice(&p_out[..l]);
 
+        // Update PLC state from the decoded frame.
+        silk_plc(ps_dec, &mut ps_dec_ctrl, p_out, 0);
+
         ps_dec.loss_cnt = 0;
         ps_dec.prev_signal_type = ps_dec.indices.signal_type as i32;
 
         ps_dec.first_frame_after_reset = 0;
     } else {
-        for i in 0..l {
-            p_out[i] = 0;
-        }
+        // Packet loss: conceal via pitch-based extrapolation.
+        silk_plc(ps_dec, &mut ps_dec_ctrl, p_out, 1);
 
         let mv_len = ps_dec.ltp_mem_length - ps_dec.frame_length;
         ps_dec.out_buf.rotate_left(ps_dec.frame_length as usize);
         ps_dec.out_buf[mv_len as usize..mv_len as usize + l].copy_from_slice(&p_out[..l]);
-
-        ps_dec.loss_cnt += 1;
     }
+
+    // Ensure smooth connection of extrapolated and good frames.
+    silk_plc_glue_frames(ps_dec, p_out, l);
 
     ps_dec.lag_prev = ps_dec_ctrl.pitch_l[ps_dec.nb_subfr as usize - 1];
 

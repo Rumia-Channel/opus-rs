@@ -209,6 +209,10 @@ fn rate_id(rate_hz: i32) -> usize {
 }
 
 impl SilkResampler {
+    pub fn is_initialized(&self) -> bool {
+        self.fs_in_khz > 0
+    }
+
     pub fn init(&mut self, fs_hz_in: i32, fs_hz_out: i32) -> i32 {
         *self = Self::default();
 

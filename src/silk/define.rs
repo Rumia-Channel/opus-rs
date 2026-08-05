@@ -135,3 +135,18 @@ pub const MAX_QGAIN_DB: i32 = 88;
 pub const N_LEVELS_QGAIN: i32 = 64;
 pub const MAX_DELTA_GAIN_QUANT: i32 = 36;
 pub const MIN_DELTA_GAIN_QUANT: i32 = -4;
+
+// PLC (packet loss concealment) constants (silk/PLC.h)
+pub const BWE_COEF_Q16: i32 = 64881; // 0.99 in Q16
+pub const V_PITCH_GAIN_START_MIN_Q14: i32 = 11469; // 0.7 in Q14
+pub const V_PITCH_GAIN_START_MAX_Q14: i32 = 15565; // 0.95 in Q14
+pub const MAX_PITCH_LAG_MS: i32 = 18;
+pub const RAND_BUF_SIZE: usize = 128;
+pub const RAND_BUF_MASK: usize = RAND_BUF_SIZE - 1;
+pub const LOG2_INV_LPC_GAIN_HIGH_THRES: i32 = 3; // 2^3 = 8 dB LPC gain
+pub const LOG2_INV_LPC_GAIN_LOW_THRES: i32 = 8; // 2^8 = 24 dB LPC gain
+pub const PITCH_DRIFT_FAC_Q16: i32 = 655; // 0.01 in Q16
+pub const NB_ATT: usize = 2;
+pub const HARM_ATT_Q15: [i16; NB_ATT] = [32440, 31130]; // 0.99, 0.95
+pub const PLC_RAND_ATTENUATE_V_Q15: [i16; NB_ATT] = [31130, 26214]; // 0.95, 0.8
+pub const PLC_RAND_ATTENUATE_UV_Q15: [i16; NB_ATT] = [32440, 29491]; // 0.99, 0.9
