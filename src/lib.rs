@@ -761,6 +761,10 @@ pub struct OpusDecoder {
     w_pcm_resampled: Vec<i16>,
     w_celt_planar: Vec<f32>,
     w_celt_out: Vec<f32>,
+
+    /// Tail of the previous frame's output, used for smooth_fade at mode
+    /// transitions (libopus pcm_transition + smooth_fade).
+    prev_pcm_tail: Vec<f32>,
 }
 
 impl OpusDecoder {
@@ -800,6 +804,8 @@ impl OpusDecoder {
             w_pcm_resampled: vec![0i16; 5760 * channels],
             w_celt_planar: vec![0.0f32; 5760 * channels],
             w_celt_out: vec![0.0f32; 5760 * channels],
+
+            prev_pcm_tail: vec![0.0f32; 120 * channels],
         })
     }
 
@@ -1092,9 +1098,7 @@ impl OpusDecoder {
                         }
                     }
                 }
-                self.prev_mode = Some(OpusMode::SilkOnly);
-                self.prev_redundancy = has_redundancy;
-                Ok(decoded_total)
+                decoded_total
             }
 
             OpusMode::CeltOnly => {
@@ -1141,9 +1145,7 @@ impl OpusDecoder {
                         }
                     }
                 }
-                self.prev_mode = Some(OpusMode::CeltOnly);
-                self.prev_redundancy = has_redundancy;
-                Ok(decoded_total)
+                decoded_total
             }
 
             OpusMode::Hybrid => {
@@ -1292,11 +1294,43 @@ impl OpusDecoder {
                             (self.w_silk_out[j] + self.w_celt_out[j]).clamp(-1.0, 1.0);
                     }
                 }
-                self.prev_mode = Some(OpusMode::Hybrid);
-                self.prev_redundancy = has_redundancy;
-                Ok(decoded_total)
+                decoded_total
             }
+        };
+
+        // Apply smooth_fade crossfade at mode transitions (libopus
+        // opus_decoder.c:660-679). This blends the last F2_5 samples of the
+        // previous frame with the first F2_5 samples of the new frame,
+        // smoothing the discontinuity at SILK↔CELT boundaries (#8/#9).
+        let f2_5 = self.sampling_rate as usize / 400;
+        if mode_transition && f2_5 > 0 && decoded_total >= f2_5 {
+            let window = modes::default_mode().window;
+            let inc = (48000 / self.sampling_rate) as usize;
+            let fade_samples = f2_5 * self.channels;
+            // Save new frame's head for the crossfade (it gets overwritten).
+            let new_head: Vec<f32> = output[..fade_samples].to_vec();
+            smooth_fade(
+                &self.prev_pcm_tail[..fade_samples],
+                &new_head,
+                &mut output[..fade_samples],
+                f2_5,
+                self.channels,
+                window,
+                inc,
+            );
         }
+
+        // Save the tail of this frame for the next transition.
+        let tail_len = f2_5 * self.channels;
+        let out_total = decoded_total * self.channels;
+        if out_total >= tail_len && tail_len <= self.prev_pcm_tail.len() {
+            self.prev_pcm_tail[..tail_len]
+                .copy_from_slice(&output[out_total - tail_len..out_total]);
+        }
+
+        self.prev_mode = Some(mode);
+        self.prev_redundancy = has_redundancy;
+        Ok(decoded_total)
     }
 }
 
@@ -1462,6 +1496,29 @@ fn frame_samples_from_toc(toc: u8, sampling_rate: i32) -> Option<usize> {
 
 fn channels_from_toc(toc: u8) -> usize {
     if toc & 0x04 != 0 { 2 } else { 1 }
+}
+
+/// Crossfade two signals using a squared-sine window (libopus smooth_fade).
+/// `window` is the 120-sample CELT window at 48 kHz; `inc` = 48000/Fs strides it.
+fn smooth_fade(
+    in1: &[f32],
+    in2: &[f32],
+    out: &mut [f32],
+    overlap: usize,
+    channels: usize,
+    window: &[f32],
+    inc: usize,
+) {
+    for c in 0..channels {
+        for i in 0..overlap {
+            let wi = i * inc;
+            if wi >= window.len() {
+                break;
+            }
+            let w = window[wi] * window[wi];
+            out[i * channels + c] = w * in2[i * channels + c] + (1.0 - w) * in1[i * channels + c];
+        }
+    }
 }
 
 /// Parse an Opus frame length per RFC 6716 §3.2.1, identical to libopus
