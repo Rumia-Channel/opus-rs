@@ -234,3 +234,47 @@ fn issue_7_stereo_silk_channels_differ() {
 fn _dbg() {
     try_decode("dbg", &[0xbb, 0x03, 0xff, 0xfe, 0xff, 0xfe, 0xff, 0xfe], 2880, 1);
 }
+
+// ---------------------------------------------------------------------------
+// SILK PLC: a lost frame (ToC-only packet) must produce non-silence
+// concealment, not zeros or a panic.
+// ---------------------------------------------------------------------------
+#[test]
+fn silk_plc_produces_concealment_audio() {
+    use opus_rs::{Application, OpusDecoder, OpusEncoder};
+    let sr = 16000;
+    let fs = 320;
+    let mut enc = OpusEncoder::new(sr, 1, Application::Voip).unwrap();
+    enc.bitrate_bps = 24000;
+
+    // Encode several frames of a sine wave.
+    let mut packets = Vec::new();
+    for i in 0..6 {
+        let input: Vec<f32> = (0..fs)
+            .map(|j| {
+                let t = (i * fs + j) as f64 / sr as f64;
+                (440.0 * t * 2.0 * std::f64::consts::PI).sin() as f32 * 0.3
+            })
+            .collect();
+        let mut pkt = vec![0u8; 512];
+        let n = enc.encode(&input, fs, &mut pkt).unwrap();
+        packets.push(pkt[..n].to_vec());
+    }
+
+    let mut dec = OpusDecoder::new(sr, 1).unwrap();
+    for pkt in &packets {
+        let mut buf = vec![0.0f32; 640];
+        dec.decode(pkt, fs, &mut buf).unwrap();
+    }
+
+    // Decode a lost frame (single ToC byte, SILK WB 20ms → PLC).
+    let lost_pkt = vec![packets[0][0] & 0xFC];
+    let mut buf = vec![0.0f32; 640];
+    let n = dec.decode(&lost_pkt, fs, &mut buf).unwrap();
+    let rms =
+        (buf[..n].iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / n as f64).sqrt();
+    assert!(
+        rms > 0.01,
+        "SILK PLC should produce concealment audio, got rms={rms}"
+    );
+}

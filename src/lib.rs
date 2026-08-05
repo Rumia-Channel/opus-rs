@@ -825,6 +825,11 @@ impl OpusDecoder {
         let bandwidth = bandwidth_from_toc(toc);
         let frame_duration_ms = frame_duration_ms_from_toc(toc);
 
+        // A packet of 0 or 1 bytes (ToC only) is a lost/DTX frame. libopus
+        // triggers PLC in this case (opus_decoder.c:315-321). We decode the
+        // frame using the previous mode's concealment.
+        let lost_frame = input.len() <= 1;
+
         if packet_channels != self.channels {
             return Err("Channel count mismatch between packet and decoder");
         }
@@ -1078,8 +1083,11 @@ impl OpusDecoder {
                         .init(internal_sample_rate, self.sampling_rate);
                     self.silk_resampler_2
                         .init(internal_sample_rate, self.sampling_rate);
-                    self.prev_internal_rate = internal_sample_rate;
                 }
+                // Always track the SILK internal rate so the mode-transition
+                // PLC bridge can be generated (even when no resampling is
+                // needed, e.g. 16kHz decoder + SILK WB).
+                self.prev_internal_rate = internal_sample_rate;
 
                 for (fi, payload) in frame_payloads.iter().enumerate() {
                     let mut rc = RangeCoder::new_decoder(payload);
@@ -1088,10 +1096,15 @@ impl OpusDecoder {
 
                     let ret = {
                         let (silk_dec, pcm_i16) = (&mut self.silk_dec, &mut self.w_pcm_i16);
+                        let lost_flag = if lost_frame {
+                            silk::decode_frame::FLAG_PACKET_LOST
+                        } else {
+                            silk::decode_frame::FLAG_DECODE_NORMAL
+                        };
                         silk_dec.decode(
                             &mut rc,
                             &mut pcm_i16[..pcm_i16_len],
-                            silk::decode_frame::FLAG_DECODE_NORMAL,
+                            lost_flag,
                             true,
                             frame_duration_ms,
                             internal_sample_rate,
@@ -1224,8 +1237,8 @@ impl OpusDecoder {
                         .init(internal_sample_rate, self.sampling_rate);
                     self.silk_resampler_2
                         .init(internal_sample_rate, self.sampling_rate);
-                    self.prev_internal_rate = internal_sample_rate;
                 }
+                self.prev_internal_rate = internal_sample_rate;
 
                 for (fi, payload) in frame_payloads.iter().enumerate() {
                     let mut rc = RangeCoder::new_decoder(payload);
@@ -1234,10 +1247,15 @@ impl OpusDecoder {
 
                     let ret = {
                         let (silk_dec, pcm_i16) = (&mut self.silk_dec, &mut self.w_pcm_i16);
+                        let lost_flag = if lost_frame {
+                            silk::decode_frame::FLAG_PACKET_LOST
+                        } else {
+                            silk::decode_frame::FLAG_DECODE_NORMAL
+                        };
                         silk_dec.decode(
                             &mut rc,
                             &mut pcm_i16[..pcm_silk_i16_len],
-                            silk::decode_frame::FLAG_DECODE_NORMAL,
+                            lost_flag,
                             true,
                             frame_duration_ms,
                             internal_sample_rate,
