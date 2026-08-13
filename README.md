@@ -8,6 +8,7 @@ A pure-Rust implementation of the [Opus audio codec](https://opus-codec.org/) (R
 
 - **Pure Rust** — no C dependencies
 - **High Performance:** Competitive with C libopus on x64/aarch64
+- **`#![no_std]` + no `alloc`:** fully heap-free — runs on bare metal, RTOS, and WebAssembly with **no global allocator**
 
 ## Quick Start
 
@@ -35,6 +36,37 @@ let samples = decoder.decode(&output[..bytes], 320, &mut pcm).unwrap();
 # Rust encoder/decoder
 cargo run --example wav_test
 ```
+
+## `#![no_std]` + no-`alloc` Support
+
+opus-rs is **fully heap-free**: it builds as `#![no_std]` with **no `alloc` crate** and therefore needs **no global allocator**. All working buffers are inline, fixed-size arrays (sized to the Opus worst case); growable state uses an internal `FixedVec<T, N>` (a tiny `Vec`-like type over `[MaybeUninit<T>; N]`).
+
+Disable the default `std` feature and enable `libm` (a pure-Rust math backend for `sin`/`cos`/`sqrt`/…, which `core` does not provide):
+
+```toml
+[dependencies.opus-rs]
+version = "0.1"
+default-features = false
+features = ["libm"]
+```
+
+The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into caller-provided buffers) is identical to the `std` build.
+
+### Feature flags
+
+| Feature  | Default | Description |
+|----------|---------|-------------|
+| `std`    | yes     | Enables OS-backed runtime x86 SIMD detection (CPUID). Without it the crate is `#![no_std]`. |
+| `libm`   | no      | Required for `#![no_std]` builds — provides float math via a pure-Rust port of musl `libm`. Not needed when `std` is on. |
+
+> Runtime dependency footprint: `std` build → **0 deps**; `no_std` build → **1 dep** (`libm`, pure Rust).
+
+### Notes for `no_std` users
+
+- **Large structs:** because every working buffer is inline, `OpusEncoder`/`OpusDecoder` are large (~250 KB / ~175 KB each). On a constrained target, place them in a `static` (wrap init in your own `Once`-like guard) or a dedicated buffer rather than on the stack. Test threads use a 16 MB stack (see `.cargo/config.toml`).
+- **x86 SIMD:** without `std`, AVX/AVX2 dispatch falls back to compile-time detection. Build with `RUSTFLAGS="-C target-feature=+avx2"` to enable it. aarch64 NEON is unconditional.
+- **Packets are capped** at the RFC 6716 maximum of 1276 bytes (the heap-free range-coder buffer is sized accordingly); standalone `RangeCoder`/CELT use supports up to 2048 bytes.
+- **Verified targets:** `thumbv7em-none-eabi` (Cortex-M), `wasm32-unknown-unknown`, and any Linux no_std target. Check with `scripts/check_no_std.sh`.
 
 ## Performance
 
@@ -64,6 +96,18 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
 | 48 kHz / 20 ms Audio | **13.97 ms** | 19.39 ms | 0.72× (**Rust 28% faster**) |
 | 48 kHz / 10 ms Audio | **16.19 ms** | 20.28 ms | 0.80× (**Rust 20% faster**) |
 
+
+## Release Notes
+
+### 0.1.27
+
+- **`#![no_std]` with no `alloc`**: the crate is now fully heap-free — no global allocator is required. All `Vec`/`Box` working buffers were replaced with an internal `FixedVec<T, N>` (inline `[MaybeUninit<T>; N]`); `std::sync::LazyLock` was replaced with a heap-free `OnceCell`; no_std float math (`sin`/`cos`/`sqrt`/…) is routed through an optional `libm` feature (pure-Rust musl port).
+  - Verified on `thumbv7em-none-eabi` (Cortex-M), `wasm32-unknown-unknown`, and Linux no_std. `scripts/check_no_std.sh` reproduces.
+  - Feature flags: `std` (default) → 0 runtime deps; `default-features = false, features = ["libm"]` → 1 dep (`libm`).
+  - Encoder/decoder structs are inline and large (~250 KB / ~175 KB); place them in a `static` or dedicated buffer on constrained targets.
+- **Performance:** unchanged vs 0.1.26 (measured within ±0.5% on `opus_real`; no per-frame allocation overhead).
+- **Conformance:** RFC 6716 1276-byte packet cap enforced on the Opus path; the standalone `RangeCoder`/CELT buffer supports up to 2048 bytes.
+- `wav_test` example now tags output files by build (`_std` / `_nostd`) for A/B listening across build modes.
 
 ## License
 

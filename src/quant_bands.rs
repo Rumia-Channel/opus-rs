@@ -1,6 +1,10 @@
 use crate::modes::CeltMode;
 use crate::range_coder::{BITRES, RangeCoder};
 
+#[cfg(not(feature = "std"))]
+use crate::compat::Math;
+use crate::fixedvec::FixedVec;
+
 pub const PRED_COEF: [f32; 4] = [
     29440.0 / 32768.0,
     26112.0 / 32768.0,
@@ -224,8 +228,8 @@ pub fn quant_coarse_energy_advanced(
     }
 
     let enc_start_state = enc.clone();
-    let mut old_e_bands_intra = old_e_bands.to_vec();
-    let mut error_intra = error.to_vec();
+    let mut old_e_bands_intra: FixedVec<f32, 42> = FixedVec::from_slice(old_e_bands);
+    let mut error_intra: FixedVec<f32, 42> = FixedVec::from_slice(error);
     let mut badness1 = 0i32;
     let mut tell_intra = 0i32;
     let intra_prob = &E_PROB_MODEL[lm][1];
@@ -506,7 +510,7 @@ pub fn unquant_energy_finalise(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::range_coder::RangeCoder;

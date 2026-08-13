@@ -1,6 +1,6 @@
 use crate::modes::CeltMode;
 use crate::range_coder::RangeCoder;
-use std::cmp::{max, min};
+use core::cmp::{max, min};
 
 const MAX_EBANDS: usize = 21;
 pub const BITRES: i32 = 3;

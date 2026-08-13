@@ -82,7 +82,7 @@ pub fn silk_gains_dequant(
 
     for k in 0..nb_subfr {
         if k == 0 && conditional == 0 {
-            *prev_ind = std::cmp::max(ind[k] as i32, (*prev_ind as i32) - 16) as i8;
+            *prev_ind = core::cmp::max(ind[k] as i32, (*prev_ind as i32) - 16) as i8;
         } else {
             ind_tmp = (ind[k] as i32) + MIN_DELTA_GAIN_QUANT;
 

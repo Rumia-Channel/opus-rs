@@ -1,4 +1,9 @@
+use crate::fixedvec::FixedVec;
 use crate::silk::define::*;
+
+/// SILK maximum frame length in samples (`5 * 4 * 16`). Used to size the
+/// heap-free stereo side buffer.
+const SILK_SIDE_MAX: usize = MAX_FRAME_LENGTH;
 
 #[derive(Clone, Default)]
 pub struct SilkStereoState {
@@ -8,7 +13,7 @@ pub struct SilkStereoState {
 
     pub left: i16,
 
-    pub side: Vec<i16>,
+    pub side: FixedVec<i16, SILK_SIDE_MAX>,
 }
 
 #[derive(Clone, Copy)]

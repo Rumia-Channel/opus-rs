@@ -1,10 +1,18 @@
+#[cfg(not(feature = "std"))]
+use crate::compat::Math;
+use crate::fixedvec::FixedVec;
+
+/// Capacity for pitch-search working buffers (x_lp4 / y_lp4 / xcorr). Bounded by
+/// `COMBFILTER_MAXPERIOD = 1024` and the maximum pitch lag.
+const PITCH_BUF_MAX: usize = 1024;
+
 #[cfg(target_arch = "aarch64")]
 use crate::celt_lpc::{autocorr, lpc};
 
 pub fn inner_prod(x: &[f32], y: &[f32], n: usize) -> f32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
-        if std::arch::is_x86_feature_detected!("avx") {
+        if crate::compat::x86_has_avx() {
             return inner_prod_avx(x, y, n);
         }
     }
@@ -32,7 +40,7 @@ pub fn inner_prod(x: &[f32], y: &[f32], n: usize) -> f32 {
 pub fn dual_inner_prod(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
-        if std::arch::is_x86_feature_detected!("avx") {
+        if crate::compat::x86_has_avx() {
             return dual_inner_prod_avx(x, y1, y2, n);
         }
     }
@@ -62,7 +70,7 @@ pub fn dual_inner_prod(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32
 pub fn pitch_xcorr(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, max_pitch: usize) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
-        if std::arch::is_x86_feature_detected!("avx") {
+        if crate::compat::x86_has_avx() {
             return pitch_xcorr_avx(x, y, xcorr, len, max_pitch);
         }
     }
@@ -96,7 +104,7 @@ pub fn pitch_xcorr(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, max_pitc
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn inner_prod_neon(x: &[f32], y: &[f32], n: usize) -> f32 {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let mut xy = vdupq_n_f32(0.0);
     let mut i = 0;
@@ -133,7 +141,7 @@ unsafe fn inner_prod_neon(x: &[f32], y: &[f32], n: usize) -> f32 {
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn dual_inner_prod_neon(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let mut xy1 = vdupq_n_f32(0.0);
     let mut xy2 = vdupq_n_f32(0.0);
@@ -182,7 +190,7 @@ unsafe fn dual_inner_prod_neon(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn xcorr_kernel_neon(x: &[f32], y: &[f32], sum: &mut [f32; 4], mut len: usize) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     debug_assert!(x.len() >= len, "xcorr_kernel_neon: x too short");
     debug_assert!(
@@ -296,7 +304,7 @@ unsafe fn pitch_xcorr_neon(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, 
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn inner_prod_sse(x: &[f32], y: &[f32], n: usize) -> f32 {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let mut sum0 = _mm_setzero_ps();
     let mut sum1 = _mm_setzero_ps();
@@ -338,7 +346,7 @@ unsafe fn inner_prod_sse(x: &[f32], y: &[f32], n: usize) -> f32 {
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn dual_inner_prod_sse(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let mut xy1 = _mm_setzero_ps();
     let mut xy2 = _mm_setzero_ps();
@@ -378,7 +386,7 @@ unsafe fn dual_inner_prod_sse(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn xcorr_kernel_sse(x: &[f32], y: &[f32], sum: &mut [f32; 4], len: usize) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let mut xsum1 = _mm_loadu_ps(sum.as_ptr());
     let mut xsum2 = _mm_setzero_ps();
@@ -464,7 +472,7 @@ unsafe fn pitch_xcorr_sse(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, m
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
 unsafe fn inner_prod_avx(x: &[f32], y: &[f32], n: usize) -> f32 {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let mut acc0 = _mm256_setzero_ps();
     let mut acc1 = _mm256_setzero_ps();
@@ -508,7 +516,7 @@ unsafe fn inner_prod_avx(x: &[f32], y: &[f32], n: usize) -> f32 {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
 unsafe fn dual_inner_prod_avx(x: &[f32], y1: &[f32], y2: &[f32], n: usize) -> (f32, f32) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let mut acc1 = _mm256_setzero_ps();
     let mut acc2 = _mm256_setzero_ps();
@@ -590,7 +598,7 @@ unsafe fn pitch_xcorr_avx(x: &[f32], y: &[f32], xcorr: &mut [f32], len: usize, m
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx,fma")]
 unsafe fn xcorr_kernel_avx(x: &[f32], y: &[f32], sum: &mut [f32; 4], len: usize) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let mut xsum1 = _mm_loadu_ps(sum.as_ptr());
     let mut xsum2 = _mm_setzero_ps();
@@ -762,7 +770,7 @@ fn pitch_downsample_boundary(x: &[&[f32]], x_lp: &mut [f32], c: usize, offset: u
 
 #[cfg(target_arch = "aarch64")]
 fn pitch_downsample_neon(x: &[&[f32]], x_lp: &mut [f32], len: usize, c: usize, offset: usize) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     unsafe {
         let v025 = vdupq_n_f32(0.25);
@@ -866,7 +874,7 @@ fn find_best_pitch(
 
     #[cfg(target_arch = "aarch64")]
     let mut syy = unsafe {
-        use std::arch::aarch64::*;
+        use core::arch::aarch64::*;
         let mut sum_vec = vdupq_n_f32(0.0);
         let mut j = 0;
         while j + 16 <= len {
@@ -894,8 +902,8 @@ fn find_best_pitch(
     };
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     let mut syy = unsafe {
-        if std::arch::is_x86_feature_detected!("avx") {
-            use std::arch::x86_64::*;
+        if crate::compat::x86_has_avx() {
+            use core::arch::x86_64::*;
             let mut acc0 = _mm256_setzero_ps();
             let mut acc1 = _mm256_setzero_ps();
             let mut j = 0;
@@ -1043,9 +1051,9 @@ fn pitch_search_heap(x_lp: &[f32], y: &[f32], mut len: usize, mut max_pitch: usi
     len >>= 1;
     let lag = len + max_pitch;
 
-    let mut x_lp4 = vec![0.0f32; len >> 1];
-    let mut y_lp4 = vec![0.0f32; lag >> 1];
-    let mut xcorr = vec![0.0f32; max_pitch];
+    let mut x_lp4: FixedVec<f32, PITCH_BUF_MAX> = FixedVec::from_value(0.0f32, len >> 1);
+    let mut y_lp4: FixedVec<f32, PITCH_BUF_MAX> = FixedVec::from_value(0.0f32, lag >> 1);
+    let mut xcorr: FixedVec<f32, PITCH_BUF_MAX> = FixedVec::from_value(0.0f32, max_pitch);
 
     for j in 0..(len >> 1) {
         x_lp4[j] = x_lp[2 * j];

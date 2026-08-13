@@ -2,7 +2,7 @@
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 name = "opus-rs"
-version = "0.1.26"
+version = "0.1.27"
 description = "pure Rust implementation of Opus codec"
 license = "BSD-3-Clause"
 repository = "https://github.com/restsend/opus-rs"
@@ -11,6 +11,22 @@ exclude = [
     "fuzz/",
     "fixtures/",
 ]
+
+[features]
+default = ["std"]
+# Without `std`, the crate is `#![no_std]` with **no `alloc`** (fully heap-free —
+# no global allocator required). All working buffers are inline fixed-size arrays.
+# `std` additionally enables OS-backed runtime x86 SIMD detection (CPUID); without
+# it, x86 SIMD falls back to compile-time `target_feature` detection.
+std = []
+# Required for `#![no_std]` builds: provides `sin`/`cos`/`sqrt`/`exp2`/... via a
+# pure-Rust port of musl libm (`core` does not provide transcendentals). Not
+# needed when `std` is enabled. Enable with:
+#   opus-rs = { version = "...", default-features = false, features = ["libm"] }
+libm = ["dep:libm"]
+
+[dependencies]
+libm = { version = "0.2", optional = true, default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }

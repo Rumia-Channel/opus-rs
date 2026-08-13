@@ -1,3 +1,5 @@
+use crate::fixedvec::FixedVec;
+
 pub const EC_SYM_BITS: u32 = 8;
 pub const EC_CODE_BITS: u32 = 32;
 pub const EC_SYM_MAX: u32 = (1 << EC_SYM_BITS) - 1;
@@ -6,6 +8,12 @@ pub const EC_CODE_TOP: u32 = 1 << (EC_CODE_BITS - 1);
 pub const EC_CODE_BOT: u32 = EC_CODE_TOP >> EC_SYM_BITS;
 pub const EC_CODE_EXTRA: u32 = (EC_CODE_BITS - 2) % EC_SYM_BITS + 1;
 pub const BITRES: i32 = 3;
+
+/// Maximum range-coder buffer capacity. Opus packets are bounded by 1276 bytes
+/// (RFC 6716 §3.1); standalone CELT usage (e.g. tests) may use up to 2048, so the
+/// heap-free buffer is sized for that. The Opus encoder additionally clamps its
+/// per-frame budget to `OPUS_MAX_PACKET_BYTES = 1276` (see `lib.rs`).
+pub const RANGE_BUF_MAX: usize = 2048;
 
 #[macro_export]
 macro_rules! tell_frac_inline {
@@ -24,7 +32,7 @@ macro_rules! tell_frac_inline {
 
 #[derive(Clone)]
 pub struct RangeCoder {
-    pub buf: Vec<u8>,
+    pub buf: FixedVec<u8, RANGE_BUF_MAX>,
     pub storage: u32,
     pub end_offs: u32,
     pub end_window: u32,
@@ -40,10 +48,11 @@ pub struct RangeCoder {
 
 impl RangeCoder {
     pub fn new_encoder(size: u32) -> Self {
-        let buf = vec![0u8; size as usize];
+        let size = (size as usize).min(RANGE_BUF_MAX).max(1);
+        let buf = FixedVec::from_value(0u8, size);
         RangeCoder {
             buf,
-            storage: size,
+            storage: size as u32,
             end_offs: 0,
             end_window: 0,
             nend_bits: 0,
@@ -59,13 +68,9 @@ impl RangeCoder {
 
     #[inline]
     pub fn reset_for_encode(&mut self, size: u32) {
-        if self.buf.len() < size as usize {
-            self.buf.resize(size as usize, 0);
-        }
-        unsafe {
-            self.buf.set_len(size as usize);
-        }
-        self.storage = size;
+        let size = (size as usize).min(RANGE_BUF_MAX).max(1);
+        self.buf.resize(size, 0);
+        self.storage = size as u32;
         self.end_offs = 0;
         self.end_window = 0;
         self.nend_bits = 0;
@@ -79,8 +84,9 @@ impl RangeCoder {
     }
 
     pub fn new_decoder(data: &[u8]) -> Self {
-        let storage = data.len() as u32;
-        let buf = data.to_vec();
+        let n = data.len().min(RANGE_BUF_MAX);
+        let storage = n as u32;
+        let buf = FixedVec::from_slice(&data[..n]);
         let mut rc = RangeCoder {
             buf,
             storage,
@@ -222,7 +228,7 @@ impl RangeCoder {
             if write_count > 0 {
                 let start = (self.storage - self.end_offs - write_count) as usize;
                 unsafe {
-                    std::ptr::write_bytes(
+                    core::ptr::write_bytes(
                         self.buf.as_mut_ptr().add(start),
                         0,
                         write_count as usize,
@@ -644,6 +650,11 @@ impl RangeCoder {
         }
     }
 
+    /// Flush pending output and return the encoded bytes.
+    ///
+    /// Allocates and is therefore only available with the `std` feature. The
+    /// `#![no_std]` encoder path reads `self.buf[..self.offs]` directly instead.
+    #[cfg(feature = "std")]
     pub fn finish(&mut self) -> Vec<u8> {
         self.done();
 
@@ -664,7 +675,7 @@ impl RangeCoder {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 

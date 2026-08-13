@@ -10,6 +10,46 @@ use crate::quant_bands::{
 use crate::range_coder::RangeCoder;
 use crate::rate::{BITRES, clt_compute_allocation};
 
+#[cfg(not(feature = "std"))]
+use crate::compat::Math;
+use crate::fixedvec::FixedVec;
+
+// --- Heap-free buffer capacity constants (all sized for the worst case:
+//     2 channels, 48 kHz, max frame). Runtime construction uses smaller logical
+//     lengths when fewer channels / bands are active; the FixedVec tracks that. ---
+/// Maximum channel count supported by the API.
+const CELT_MAX_CHANNELS: usize = 2;
+/// Number of energy bands (`nb_ebands`) for the 48 kHz / 120-overlap mode.
+const CELT_NB_EBANDS: usize = 21;
+/// `nb_ebands * max_channels` = worst-case per-band-per-channel element count.
+const CELT_NB_X_CH: usize = CELT_NB_EBANDS * CELT_MAX_CHANNELS;
+/// MDCT overlap for the default mode.
+const CELT_OVERLAP: usize = 120;
+/// CELT synthesis / decode memory window per channel.
+const CELT_CHANNEL_MEM: usize = 2048 + CELT_OVERLAP;
+/// `channels * channel_mem` worst case.
+const CELT_SYN_MEM: usize = CELT_MAX_CHANNELS * CELT_CHANNEL_MEM;
+/// Prefilter comb-filter memory: `channels * COMBFILTER_MAXPERIOD`.
+const CELT_PREFILTER_MEM: usize = CELT_MAX_CHANNELS * COMBFILTER_MAXPERIOD;
+/// Encoder input buffer stride: `(MAX_FRAME_SIZE + overlap) * channels`.
+const CELT_BUFSTRIDE: usize = (MAX_FRAME_SIZE + CELT_OVERLAP) * CELT_MAX_CHANNELS;
+/// `MAX_FRAME_SIZE * channels`.
+const CELT_FRAME_X_CH: usize = MAX_FRAME_SIZE * CELT_MAX_CHANNELS;
+/// Frequency scratch (+4 padding for NEON pre-rotation over-read).
+const CELT_W_FREQ: usize = CELT_FRAME_X_CH + 4;
+/// PVQ stride-access scratch: `frame_x_ch + STRIDE_ACCESS_PAD`.
+const CELT_W_X_ENC: usize = CELT_FRAME_X_CH + STRIDE_ACCESS_PAD;
+/// Prefilter pre-scratch: `channels * (COMBFILTER_MAXPERIOD + MAX_FRAME_SIZE)`.
+const CELT_PREFILTER_PRE: usize = CELT_MAX_CHANNELS * (COMBFILTER_MAXPERIOD + MAX_FRAME_SIZE);
+/// Prefilter pitch buffer: `(COMBFILTER_MAXPERIOD + MAX_FRAME_SIZE) >> 1`.
+const CELT_PREFILTER_PITCH: usize = (COMBFILTER_MAXPERIOD + MAX_FRAME_SIZE) >> 1;
+/// Decoder `w_x`: `DECODE_BUFFER_SIZE * channels + STRIDE_ACCESS_PAD`.
+const CELT_W_X_DEC: usize = DECODE_BUFFER_SIZE * CELT_MAX_CHANNELS + STRIDE_ACCESS_PAD;
+/// Decoder `w_freq`: `DECODE_BUFFER_SIZE * channels + 4`.
+const CELT_W_FREQ_DEC: usize = DECODE_BUFFER_SIZE * CELT_MAX_CHANNELS + 4;
+/// Decoder `decode_mem`: `channels * (DECODE_BUFFER_SIZE + overlap)`.
+const CELT_DECODE_MEM: usize = CELT_MAX_CHANNELS * (DECODE_BUFFER_SIZE + CELT_OVERLAP);
+
 /// CELT internal-to-API decimation factor (port of libopus `resampling_factor`).
 /// The CELT decoder always runs at 48 kHz internally; the output is decimated
 /// by this factor to reach the API sampling rate.
@@ -25,7 +65,7 @@ fn resampling_factor(sampling_rate: i32) -> usize {
 }
 
 #[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::*;
+use core::arch::aarch64::*;
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -75,7 +115,7 @@ unsafe fn sum_abs_neon(x: &[f32], n: usize) -> f32 {
 fn sum_abs(x: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        if std::arch::is_x86_feature_detected!("avx") {
+        if crate::compat::x86_has_avx() {
             return sum_abs_avx(x, x.len());
         }
     }
@@ -91,7 +131,11 @@ fn sum_abs(x: &[f32]) -> f32 {
 
 const MAX_FRAME_SIZE: usize = 2880;
 
-const DECODE_BUFFER_SIZE: usize = 3072;
+/// Largest CELT-internal synthesis buffer. The CELT decoder writes `n + overlap`
+/// MDCT samples per channel where `n ≤ frame_size ≤ 960` (20 ms @ 48 kHz); 2048
+/// is the libopus reference value (`DECODE_BUFFER_SIZE`) and gives ample margin.
+/// (Reduced from a previous 3072 to shrink the heap-free footprint.)
+const DECODE_BUFFER_SIZE: usize = 2048;
 
 const INV_TABLE: [u8; 128] = [
     255, 255, 156, 110, 86, 70, 59, 51, 45, 40, 37, 33, 31, 28, 26, 25, 23, 22, 21, 20, 19, 18, 17,
@@ -229,7 +273,7 @@ fn transient_analysis(
 fn l1_metric(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        if n >= 16 && std::arch::is_x86_feature_detected!("avx") {
+        if n >= 16 && crate::compat::x86_has_avx() {
             return l1_metric_avx(tmp, n, lm, bias);
         }
     }
@@ -250,7 +294,7 @@ fn l1_metric(tmp: &[f32], n: usize, lm: i32, bias: f32) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 unsafe fn sum_abs_avx(x: &[f32], n: usize) -> f32 {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let mut sum0 = _mm256_setzero_ps();
     let mut sum1 = _mm256_setzero_ps();
@@ -590,7 +634,7 @@ fn stereo_analysis(m: &CeltMode, x: &[f32], lm: i32, n0: usize) -> bool {
         }
     }
 
-    sum_ms *= std::f32::consts::FRAC_1_SQRT_2;
+    sum_ms *= core::f32::consts::FRAC_1_SQRT_2;
     let mut thetas = 13;
     if lm <= 1 {
         thetas -= 8;
@@ -629,7 +673,7 @@ fn comb_filter_const(
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
-        if std::arch::is_x86_feature_detected!("avx") {
+        if crate::compat::x86_has_avx() {
             comb_filter_const_avx(y, x, y_idx, x_idx, t, n, g10, g11, g12);
             return;
         }
@@ -712,7 +756,7 @@ unsafe fn comb_filter_const_neon_impl(
     g11: f32,
     g12: f32,
 ) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let g10v = vdupq_n_f32(g10);
     let g11v = vdupq_n_f32(g11);
@@ -745,7 +789,7 @@ unsafe fn comb_filter_const_neon_impl(
         i += 4;
     }
 
-    let x0v_arr: [f32; 4] = std::mem::transmute(x0v);
+    let x0v_arr: [f32; 4] = core::mem::transmute(x0v);
     let mut sx4 = x0v_arr[0];
     let mut sx3 = x0v_arr[1];
     let mut sx2 = x0v_arr[2];
@@ -776,7 +820,7 @@ unsafe fn comb_filter_const_sse(
     g11: f32,
     g12: f32,
 ) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let g10v = _mm_set1_ps(g10);
     let g11v = _mm_set1_ps(g11);
@@ -811,7 +855,7 @@ unsafe fn comb_filter_const_sse(
         i += 4;
     }
 
-    let x0v_arr: [f32; 4] = std::mem::transmute(x0v);
+    let x0v_arr: [f32; 4] = core::mem::transmute(x0v);
     let mut sx4 = x0v_arr[0];
     let mut sx3 = x0v_arr[1];
     let mut sx2 = x0v_arr[2];
@@ -842,7 +886,7 @@ unsafe fn comb_filter_const_avx(
     g11: f32,
     g12: f32,
 ) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let g10v = _mm256_set1_ps(g10);
     let g11v = _mm256_set1_ps(g11);
@@ -945,7 +989,7 @@ unsafe fn comb_filter_const_sse_fma(
     g11: f32,
     g12: f32,
 ) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let g10v = _mm_set1_ps(g10);
     let g11v = _mm_set1_ps(g11);
@@ -973,7 +1017,7 @@ unsafe fn comb_filter_const_sse_fma(
         i += 4;
     }
 
-    let x0v_arr: [f32; 4] = std::mem::transmute(x0v);
+    let x0v_arr: [f32; 4] = core::mem::transmute(x0v);
     let mut sx4 = x0v_arr[0];
     let mut sx3 = x0v_arr[1];
     let mut sx2 = x0v_arr[2];
@@ -1006,7 +1050,7 @@ fn comb_filter(
     overlap: usize,
 ) {
     if g0 == 0.0 && g1 == 0.0 {
-        if x_idx != y_idx || !std::ptr::eq(x.as_ptr(), y.as_ptr()) {
+        if x_idx != y_idx || !core::ptr::eq(x.as_ptr(), y.as_ptr()) {
             y[y_idx..y_idx + n].copy_from_slice(&x[x_idx..x_idx + n]);
         }
         return;
@@ -1173,9 +1217,10 @@ fn run_prefilter(
 
     let pitch_buf_len = (max_period + frame_size) >> 1;
     {
-        let pre_slices: Vec<&[f32]> = (0..channels)
-            .map(|c| &pre[c * pre_size..c * pre_size + pre_size])
-            .collect();
+        let mut pre_slices: FixedVec<&[f32], 2> = FixedVec::new();
+        for c in 0..channels {
+            pre_slices.push(&pre[c * pre_size..c * pre_size + pre_size]);
+        }
         crate::pitch::pitch_downsample(&pre_slices, pitch_buf, pitch_buf_len, channels, 2);
     }
 
@@ -1340,55 +1385,58 @@ fn run_prefilter(
     (pf_on, gain1, pitch_index)
 }
 
-const STRIDE_ACCESS_PAD: usize = crate::pvq::MAX_PVQ_N * 8;
+/// Padding appended to `w_x` to absorb any SIMD over-shoot past the last band.
+/// Sized to `MAX_PVQ_N` (352) — far larger than the widest SIMD access (16),
+/// which is always loop-guarded (`while i + width <= n`). (Previously
+/// `MAX_PVQ_N * 8`, which had no access pattern justifying it.)
+const STRIDE_ACCESS_PAD: usize = crate::pvq::MAX_PVQ_N;
 
 pub struct CeltEncoder {
     mode: &'static CeltMode,
     channels: usize,
     pub complexity: i32,
-    syn_mem: Vec<f32>,
-    enc_decode_mem: Vec<f32>,
-    old_band_e: Vec<f32>,
-    preemph_mem: Vec<f32>,
+    syn_mem: FixedVec<f32, CELT_SYN_MEM>,
+    enc_decode_mem: FixedVec<f32, CELT_SYN_MEM>,
+    old_band_e: FixedVec<f32, CELT_NB_X_CH>,
+    preemph_mem: FixedVec<f32, CELT_MAX_CHANNELS>,
     tonal_average: i32,
     hf_average: i32,
     tapset_decision: i32,
     spread_decision: i32,
     intensity: i32,
     last_coded_bands: i32,
-    prefilter_mem: Vec<f32>,
+    prefilter_mem: FixedVec<f32, CELT_PREFILTER_MEM>,
     prefilter_period: usize,
     prefilter_gain: f32,
     prefilter_tapset: i32,
-    old_band_e2: Vec<f32>,
-    old_band_e3: Vec<f32>,
-    last_band_log_e: Vec<f32>,
+    old_band_e2: FixedVec<f32, CELT_NB_X_CH>,
+    old_band_e3: FixedVec<f32, CELT_NB_X_CH>,
+    last_band_log_e: FixedVec<f32, CELT_NB_X_CH>,
     delayed_intra: f32,
 
-    w_in_buf: Vec<f32>,
-    w_freq: Vec<f32>,
-    w_band_e: Vec<f32>,
-    w_x: Vec<f32>,
-    w_band_log_e: Vec<f32>,
-    w_error: Vec<f32>,
-    w_tf_res: Vec<i32>,
-    w_cap: Vec<i32>,
-    w_offsets: Vec<i32>,
-    w_pulses: Vec<i32>,
-    w_ebits: Vec<i32>,
-    w_fine_priority: Vec<i32>,
-    w_collapse_masks: Vec<u32>,
-    w_band_amp_synth: Vec<f32>,
-    w_freq_synth: Vec<f32>,
+    w_in_buf: FixedVec<f32, CELT_BUFSTRIDE>,
+    w_freq: FixedVec<f32, CELT_W_FREQ>,
+    w_band_e: FixedVec<f32, CELT_NB_X_CH>,
+    w_x: FixedVec<f32, CELT_W_X_ENC>,
+    w_band_log_e: FixedVec<f32, CELT_NB_X_CH>,
+    w_error: FixedVec<f32, CELT_NB_X_CH>,
+    w_tf_res: FixedVec<i32, CELT_NB_EBANDS>,
+    w_cap: FixedVec<i32, CELT_NB_EBANDS>,
+    w_offsets: FixedVec<i32, CELT_NB_EBANDS>,
+    w_pulses: FixedVec<i32, CELT_NB_EBANDS>,
+    w_ebits: FixedVec<i32, CELT_NB_X_CH>,
+    w_fine_priority: FixedVec<i32, CELT_NB_X_CH>,
+    w_collapse_masks: FixedVec<u32, CELT_NB_X_CH>,
+    w_band_amp_synth: FixedVec<f32, CELT_NB_X_CH>,
     consec_transient: i32,
 
-    w_prefilter_pre: Vec<f32>,
-    w_prefilter_pitch_buf: Vec<f32>,
-    w_prefilter_before: Vec<f32>,
-    w_prefilter_after: Vec<f32>,
+    w_prefilter_pre: FixedVec<f32, CELT_PREFILTER_PRE>,
+    w_prefilter_pitch_buf: FixedVec<f32, CELT_PREFILTER_PITCH>,
+    w_prefilter_before: FixedVec<f32, CELT_MAX_CHANNELS>,
+    w_prefilter_after: FixedVec<f32, CELT_MAX_CHANNELS>,
 
-    w_transient_tmp: Vec<f32>,
-    w_transient_tmp2: Vec<f32>,
+    w_transient_tmp: FixedVec<f32, MAX_TRANSIENT_LEN>,
+    w_transient_tmp2: FixedVec<f32, { MAX_TRANSIENT_LEN / 2 }>,
 
     analysis: AnalysisInfo,
     loss_rate: i32,
@@ -1492,14 +1540,18 @@ fn alloc_trim_analysis(
 #[inline(always)]
 fn median3(a: f32, b: f32, c: f32) -> f32 {
     let mut v = [a, b, c];
-    v.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    crate::compat::sort_by(&mut v[..], |x, y| {
+        x.partial_cmp(y).unwrap_or(core::cmp::Ordering::Equal)
+    });
     v[1]
 }
 
 #[inline(always)]
 fn median5(v: &[f32]) -> f32 {
     let mut x = [v[0], v[1], v[2], v[3], v[4]];
-    x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    crate::compat::sort_by(&mut x[..], |a, b| {
+        a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal)
+    });
     x[2]
 }
 
@@ -1523,11 +1575,11 @@ fn dynalloc_analysis_simple(
     }
 
     let nb = mode.nb_ebands;
-    let mut follower = vec![0.0f32; nb * channels];
+    let mut follower: FixedVec<f32, CELT_NB_X_CH> = FixedVec::from_value(0.0f32, nb * channels);
 
     for c in 0..channels {
         let base = c * nb;
-        let mut band_log_e3 = vec![0.0f32; end];
+        let mut band_log_e3: FixedVec<f32, CELT_NB_EBANDS> = FixedVec::from_value(0.0f32, end);
         for i in 0..end {
             let mut e = band_log_e[base + i];
             if lm == 0 && i < 8 {
@@ -1647,48 +1699,47 @@ impl CeltEncoder {
             mode,
             channels,
             complexity: 9,
-            syn_mem: vec![0.0; syn_mem_size],
-            enc_decode_mem: vec![0.0; syn_mem_size],
-            old_band_e: vec![0.0; nb_x_ch],
-            preemph_mem: vec![0.0; channels],
+            syn_mem: FixedVec::from_value(0.0, syn_mem_size),
+            enc_decode_mem: FixedVec::from_value(0.0, syn_mem_size),
+            old_band_e: FixedVec::from_value(0.0, nb_x_ch),
+            preemph_mem: FixedVec::from_value(0.0, channels),
             tonal_average: 256,
             hf_average: 0,
             tapset_decision: 0,
             spread_decision: SPREAD_NORMAL,
             intensity: 0,
             last_coded_bands: 0,
-            prefilter_mem: vec![0.0; channels * COMBFILTER_MAXPERIOD],
+            prefilter_mem: FixedVec::from_value(0.0, channels * COMBFILTER_MAXPERIOD),
             prefilter_period: COMBFILTER_MINPERIOD,
             prefilter_gain: 0.0,
             prefilter_tapset: 0,
-            old_band_e2: vec![0.0; nb_x_ch],
-            old_band_e3: vec![0.0; nb_x_ch],
-            last_band_log_e: vec![0.0; nb_x_ch],
+            old_band_e2: FixedVec::from_value(0.0, nb_x_ch),
+            old_band_e3: FixedVec::from_value(0.0, nb_x_ch),
+            last_band_log_e: FixedVec::from_value(0.0, nb_x_ch),
             delayed_intra: 0.0,
 
-            w_in_buf: vec![0.0; bufstride_x_ch],
-            w_freq: vec![0.0; frame_x_ch + 4],
-            w_band_e: vec![0.0; nb_x_ch],
+            w_in_buf: FixedVec::from_value(0.0, bufstride_x_ch),
+            w_freq: FixedVec::from_value(0.0, frame_x_ch + 4),
+            w_band_e: FixedVec::from_value(0.0, nb_x_ch),
 
-            w_x: vec![0.0; frame_x_ch + STRIDE_ACCESS_PAD],
-            w_band_log_e: vec![0.0; nb_x_ch],
-            w_error: vec![0.0; nb_x_ch],
-            w_tf_res: vec![0; nb_ebands],
-            w_cap: vec![0; nb_ebands],
-            w_offsets: vec![0; nb_ebands],
-            w_pulses: vec![0; nb_ebands],
-            w_ebits: vec![0; nb_x_ch],
-            w_fine_priority: vec![0; nb_x_ch],
-            w_collapse_masks: vec![0; nb_x_ch],
-            w_band_amp_synth: vec![0.0; nb_x_ch],
-            w_freq_synth: vec![0.0; frame_x_ch + 4],
+            w_x: FixedVec::from_value(0.0, frame_x_ch + STRIDE_ACCESS_PAD),
+            w_band_log_e: FixedVec::from_value(0.0, nb_x_ch),
+            w_error: FixedVec::from_value(0.0, nb_x_ch),
+            w_tf_res: FixedVec::from_value(0, nb_ebands),
+            w_cap: FixedVec::from_value(0, nb_ebands),
+            w_offsets: FixedVec::from_value(0, nb_ebands),
+            w_pulses: FixedVec::from_value(0, nb_ebands),
+            w_ebits: FixedVec::from_value(0, nb_x_ch),
+            w_fine_priority: FixedVec::from_value(0, nb_x_ch),
+            w_collapse_masks: FixedVec::from_value(0, nb_x_ch),
+            w_band_amp_synth: FixedVec::from_value(0.0, nb_x_ch),
 
-            w_prefilter_pre: vec![0.0; channels * (COMBFILTER_MAXPERIOD + MAX_FRAME_SIZE)],
-            w_prefilter_pitch_buf: vec![0.0; (COMBFILTER_MAXPERIOD + MAX_FRAME_SIZE) >> 1],
-            w_prefilter_before: vec![0.0; channels],
-            w_prefilter_after: vec![0.0; channels],
-            w_transient_tmp: vec![0.0; MAX_TRANSIENT_LEN],
-            w_transient_tmp2: vec![0.0; MAX_TRANSIENT_LEN / 2],
+            w_prefilter_pre: FixedVec::from_value(0.0, channels * (COMBFILTER_MAXPERIOD + MAX_FRAME_SIZE)),
+            w_prefilter_pitch_buf: FixedVec::from_value(0.0, (COMBFILTER_MAXPERIOD + MAX_FRAME_SIZE) >> 1),
+            w_prefilter_before: FixedVec::from_value(0.0, channels),
+            w_prefilter_after: FixedVec::from_value(0.0, channels),
+            w_transient_tmp: FixedVec::from_value(0.0, MAX_TRANSIENT_LEN),
+            w_transient_tmp2: FixedVec::from_value(0.0, MAX_TRANSIENT_LEN / 2),
             consec_transient: 0,
 
             analysis: AnalysisInfo::default(),
@@ -2263,8 +2314,10 @@ impl CeltEncoder {
         if resynth {
             let band_amp_synth = &mut self.w_band_amp_synth[..nb_ebands * channels];
             log2amp(mode, nb_ebands, band_amp_synth, &self.old_band_e, channels);
-            self.w_freq_synth[..frame_size * channels].fill(0.0);
-            let freq_synth = &mut self.w_freq_synth[..frame_size * channels];
+            // `w_freq` is no longer needed after analysis/quant; reuse it as the
+            // synthesis scratch (avoids a separate `w_freq_synth` buffer).
+            self.w_freq[..frame_size * channels].fill(0.0);
+            let freq_synth = &mut self.w_freq[..frame_size * channels];
             denormalise_bands(
                 mode,
                 x,
@@ -2347,32 +2400,32 @@ pub struct CeltDecoder {
     /// Decimation factor for non-48kHz API rates (1=48k, 2=24k, 3=16k, 4=12k, 6=8k).
     /// Mirrors libopus `CELTDecoder.downsample`.
     downsample: usize,
-    decode_mem: Vec<f32>,
-    old_band_e: Vec<f32>,
-    preemph_mem: Vec<f32>,
-    prefilter_mem: Vec<f32>,
+    decode_mem: FixedVec<f32, CELT_DECODE_MEM>,
+    old_band_e: FixedVec<f32, CELT_NB_X_CH>,
+    preemph_mem: FixedVec<f32, CELT_MAX_CHANNELS>,
+    prefilter_mem: FixedVec<f32, CELT_PREFILTER_MEM>,
     prefilter_period: usize,
     prefilter_period_old: usize,
     prefilter_gain: f32,
     prefilter_gain_old: f32,
     prefilter_tapset: i32,
     prefilter_tapset_old: i32,
-    old_band_e2: Vec<f32>,
-    old_band_e3: Vec<f32>,
+    old_band_e2: FixedVec<f32, CELT_NB_X_CH>,
+    old_band_e3: FixedVec<f32, CELT_NB_X_CH>,
     rng: u32,
 
-    w_tf_res: Vec<i32>,
-    w_cap: Vec<i32>,
-    w_offsets: Vec<i32>,
-    w_pulses: Vec<i32>,
-    w_ebits: Vec<i32>,
-    w_fine_priority: Vec<i32>,
-    w_x: Vec<f32>,
-    w_collapse_masks: Vec<u32>,
-    w_freq: Vec<f32>,
-    w_band_amp: Vec<f32>,
-    w_pcm_frame: Vec<f32>,
-    w_post: Vec<f32>,
+    w_tf_res: FixedVec<i32, CELT_NB_EBANDS>,
+    w_cap: FixedVec<i32, CELT_NB_EBANDS>,
+    w_offsets: FixedVec<i32, CELT_NB_EBANDS>,
+    w_pulses: FixedVec<i32, CELT_NB_EBANDS>,
+    w_ebits: FixedVec<i32, CELT_NB_X_CH>,
+    w_fine_priority: FixedVec<i32, CELT_NB_X_CH>,
+    w_x: FixedVec<f32, CELT_W_X_DEC>,
+    w_collapse_masks: FixedVec<u32, CELT_NB_X_CH>,
+    w_freq: FixedVec<f32, CELT_W_FREQ_DEC>,
+    w_band_amp: FixedVec<f32, CELT_NB_X_CH>,
+    w_pcm_frame: FixedVec<f32, DECODE_BUFFER_SIZE>,
+    w_post: FixedVec<f32, { DECODE_BUFFER_SIZE + COMBFILTER_MAXPERIOD }>,
 }
 
 impl CeltDecoder {
@@ -2388,33 +2441,33 @@ impl CeltDecoder {
             mode,
             channels,
             downsample: resampling_factor(sampling_rate),
-            decode_mem: vec![0.0; channels * (DECODE_BUFFER_SIZE + overlap)],
-            old_band_e: vec![0.0; nb_x_ch],
-            preemph_mem: vec![0.0; channels],
-            prefilter_mem: vec![0.0; channels * COMBFILTER_MAXPERIOD],
+            decode_mem: FixedVec::from_value(0.0, channels * (DECODE_BUFFER_SIZE + overlap)),
+            old_band_e: FixedVec::from_value(0.0, nb_x_ch),
+            preemph_mem: FixedVec::from_value(0.0, channels),
+            prefilter_mem: FixedVec::from_value(0.0, channels * COMBFILTER_MAXPERIOD),
             prefilter_period: COMBFILTER_MINPERIOD,
             prefilter_period_old: COMBFILTER_MINPERIOD,
             prefilter_gain: 0.0,
             prefilter_gain_old: 0.0,
             prefilter_tapset: 0,
             prefilter_tapset_old: 0,
-            old_band_e2: vec![0.0; nb_x_ch],
-            old_band_e3: vec![0.0; nb_x_ch],
+            old_band_e2: FixedVec::from_value(0.0, nb_x_ch),
+            old_band_e3: FixedVec::from_value(0.0, nb_x_ch),
             rng: 0,
 
-            w_tf_res: vec![0; nb_ebands],
-            w_cap: vec![0; nb_ebands],
-            w_offsets: vec![0; nb_ebands],
-            w_pulses: vec![0; nb_ebands],
-            w_ebits: vec![0; nb_x_ch],
-            w_fine_priority: vec![0; nb_x_ch],
+            w_tf_res: FixedVec::from_value(0, nb_ebands),
+            w_cap: FixedVec::from_value(0, nb_ebands),
+            w_offsets: FixedVec::from_value(0, nb_ebands),
+            w_pulses: FixedVec::from_value(0, nb_ebands),
+            w_ebits: FixedVec::from_value(0, nb_x_ch),
+            w_fine_priority: FixedVec::from_value(0, nb_x_ch),
 
-            w_x: vec![0.0; dec_frame_x_ch + STRIDE_ACCESS_PAD],
-            w_collapse_masks: vec![0; nb_x_ch],
-            w_freq: vec![0.0; dec_frame_x_ch + 4], // +4: NEON backward pre-rotation reads up to 3 elements past n2
-            w_band_amp: vec![0.0; nb_x_ch],
-            w_pcm_frame: vec![0.0; DECODE_BUFFER_SIZE],
-            w_post: vec![0.0; DECODE_BUFFER_SIZE + COMBFILTER_MAXPERIOD],
+            w_x: FixedVec::from_value(0.0, dec_frame_x_ch + STRIDE_ACCESS_PAD),
+            w_collapse_masks: FixedVec::from_value(0, nb_x_ch),
+            w_freq: FixedVec::from_value(0.0, dec_frame_x_ch + 4), // +4: NEON backward pre-rotation reads up to 3 elements past n2
+            w_band_amp: FixedVec::from_value(0.0, nb_x_ch),
+            w_pcm_frame: FixedVec::from_value(0.0, DECODE_BUFFER_SIZE),
+            w_post: FixedVec::from_value(0.0, DECODE_BUFFER_SIZE + COMBFILTER_MAXPERIOD),
         }
     }
 
@@ -2989,7 +3042,7 @@ impl CeltDecoder {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::{modes, range_coder::RangeCoder};

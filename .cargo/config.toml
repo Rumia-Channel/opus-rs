@@ -1,0 +1,9 @@
+# opus-rs is fully `#![no_std]` with no global allocator: its encoder/decoder
+# structs hold all working buffers inline, so `OpusEncoder` / `OpusDecoder` are
+# large (~360 KB each). The default test-thread stack (often 512 KB–2 MB) is not
+# enough to hold them, so give every cargo-spawned process a generous stack.
+#
+# The Rust test harness reads `RUST_MIN_STACK` and uses it as the per-test thread
+# stack size.
+[env]
+RUST_MIN_STACK = "16777216"

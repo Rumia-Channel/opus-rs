@@ -1,6 +1,10 @@
+#![cfg_attr(not(feature = "std"), no_std)]
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::needless_range_loop)]
+
+mod compat;
+mod fixedvec;
 
 pub mod bands;
 pub mod celt;
@@ -29,6 +33,30 @@ use silk::log2lin::silk_log2lin;
 use silk::macros::*;
 use silk::resampler::{silk_resampler_down2, silk_resampler_down2_3};
 use silk::structs::SilkEncoderState;
+use crate::fixedvec::FixedVec;
+
+// --- Heap-free buffer capacity constants (worst case: 2 channels). ---
+const OPUS_MAX_CHANNELS: usize = 2;
+/// Largest API frame in samples/channel (120 ms @ 48 kHz = 5760). Used by the
+/// encoder's per-frame input buffers (sized `frame_size * channels`).
+const OPUS_MAX_FRAME: usize = 5760;
+/// Largest *single-frame* samples/channel (60 ms @ 48 kHz = 2880). The decoder's
+/// staging buffers hold one sub-frame at a time, so they're sized to this — not
+/// the full packet. (Halves the decoder footprint vs. a naive 5760/channel.)
+const OPUS_MAX_SUBFRAME: usize = 2880;
+/// Decoder per-sub-frame staging cap: `OPUS_MAX_SUBFRAME * max_channels`.
+const OPUS_SUBFRAME_SCRATCH: usize = OPUS_MAX_SUBFRAME * OPUS_MAX_CHANNELS;
+/// High-pass filter state memory (`channels * 2`).
+const OPUS_HP_MEM: usize = OPUS_MAX_CHANNELS * 2;
+/// Decoder `w_pcm_i16` cap (`960 * max_channels`).
+const OPUS_PCM_I16: usize = 960 * OPUS_MAX_CHANNELS;
+/// Decoder `prev_pcm_tail` cap (`240 * max_channels`).
+const OPUS_PCM_TAIL: usize = 240 * OPUS_MAX_CHANNELS;
+/// Max number of frames encoded in one Opus packet (RFC 6716 caps at 48 for
+/// 2.5 ms codes in a 120 ms packet).
+const OPUS_MAX_PACKET_FRAMES: usize = 48;
+/// RFC 6716 §3.1: a single Opus packet carries at most 1276 bytes of data.
+const OPUS_MAX_PACKET_BYTES: usize = 1276;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Application {
@@ -56,7 +84,7 @@ enum OpusMode {
 
 pub struct OpusEncoder {
     celt_enc: CeltEncoder,
-    silk_enc: Box<SilkEncoderState>,
+    silk_enc: SilkEncoderState,
     application: Application,
     sampling_rate: i32,
     channels: usize,
@@ -73,13 +101,13 @@ pub struct OpusEncoder {
     prev_enc_mode: Option<OpusMode>,
 
     variable_hp_smth2_q15: i32,
-    hp_mem: Vec<i32>,
+    hp_mem: FixedVec<i32, OPUS_HP_MEM>,
 
-    buf_filtered: Vec<i16>,
-    buf_silk_input: Vec<i16>,
-    buf_stereo_mid: Vec<i16>,
-    buf_stereo_side: Vec<i16>,
-    buf_celt_input: Vec<f32>,
+    buf_filtered: FixedVec<i16, OPUS_MAX_FRAME>,
+    buf_silk_input: FixedVec<i16, OPUS_MAX_FRAME>,
+    buf_stereo_mid: FixedVec<i16, OPUS_MAX_FRAME>,
+    buf_stereo_side: FixedVec<i16, OPUS_MAX_FRAME>,
+    buf_celt_input: FixedVec<f32, OPUS_MAX_FRAME>,
     down2_state_first: [i32; 2],
     down2_state_second: [i32; 2],
     down2_3_state: [i32; 6],
@@ -174,7 +202,7 @@ fn compute_silk_rate_for_hybrid(rate_bps: i32, frame20ms: bool) -> i32 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod silk_rate_tests {
     use super::compute_silk_rate_for_hybrid;
 
@@ -222,7 +250,7 @@ impl OpusEncoder {
         let mode = modes::default_mode();
         let celt_enc = CeltEncoder::new(mode, channels);
 
-        let mut silk_enc = Box::new(SilkEncoderState::default());
+        let mut silk_enc = SilkEncoderState::default();
         if silk_init_encoder(&mut silk_enc, 0) != 0 {
             return Err("SILK encoder initialization failed");
         }
@@ -292,13 +320,13 @@ impl OpusEncoder {
             prev_enc_mode: None,
             mode: opus_mode,
             variable_hp_smth2_q15,
-            hp_mem: vec![0; channels * 2],
+            hp_mem: FixedVec::from_value(0, channels * 2),
 
-            buf_filtered: Vec::new(),
-            buf_silk_input: Vec::new(),
-            buf_stereo_mid: Vec::new(),
-            buf_stereo_side: Vec::new(),
-            buf_celt_input: Vec::new(),
+            buf_filtered: FixedVec::new(),
+            buf_silk_input: FixedVec::new(),
+            buf_stereo_mid: FixedVec::new(),
+            buf_stereo_side: FixedVec::new(),
+            buf_celt_input: FixedVec::new(),
             down2_state_first: [0; 2],
             down2_state_second: [0; 2],
             down2_3_state: [0; 6],
@@ -413,7 +441,12 @@ impl OpusEncoder {
         let cbr_bytes = ((target_bits + 4) / 8) as usize;
         let max_data_bytes = output.len();
 
-        let n_bytes = cbr_bytes.min(max_data_bytes).max(1);
+        // Cap at the Opus per-packet maximum (RFC 6716); the range coder's buffer
+        // is heap-free and sized to this constant.
+        let n_bytes = cbr_bytes
+            .min(max_data_bytes)
+            .max(1)
+            .min(OPUS_MAX_PACKET_BYTES);
 
         let init_rc_size = n_bytes - 1;
         self.rc.reset_for_encode(init_rc_size as u32);
@@ -756,15 +789,15 @@ pub struct OpusDecoder {
 
     pub hybrid_skip_celt: bool,
 
-    w_pcm_i16: Vec<i16>,
-    w_silk_out: Vec<f32>,
-    w_pcm_resampled: Vec<i16>,
-    w_celt_planar: Vec<f32>,
-    w_celt_out: Vec<f32>,
+    w_pcm_i16: FixedVec<i16, OPUS_PCM_I16>,
+    w_silk_out: FixedVec<f32, OPUS_SUBFRAME_SCRATCH>,
+    w_pcm_resampled: FixedVec<i16, OPUS_SUBFRAME_SCRATCH>,
+    w_celt_planar: FixedVec<f32, OPUS_SUBFRAME_SCRATCH>,
+    w_celt_out: FixedVec<f32, OPUS_SUBFRAME_SCRATCH>,
 
     /// Tail of the previous frame's output, used for smooth_fade at mode
     /// transitions (libopus pcm_transition + smooth_fade).
-    prev_pcm_tail: Vec<f32>,
+    prev_pcm_tail: FixedVec<f32, OPUS_PCM_TAIL>,
 }
 
 impl OpusDecoder {
@@ -798,14 +831,14 @@ impl OpusDecoder {
             prev_internal_rate: 0,
             hybrid_skip_celt: false,
 
-            w_pcm_i16: vec![0i16; 960 * channels],
+            w_pcm_i16: FixedVec::from_value(0i16, 960 * channels),
 
-            w_silk_out: vec![0.0f32; 5760 * channels],
-            w_pcm_resampled: vec![0i16; 5760 * channels],
-            w_celt_planar: vec![0.0f32; 5760 * channels],
-            w_celt_out: vec![0.0f32; 5760 * channels],
+            w_silk_out: FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels),
+            w_pcm_resampled: FixedVec::from_value(0i16, OPUS_MAX_SUBFRAME * channels),
+            w_celt_planar: FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels),
+            w_celt_out: FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels),
 
-            prev_pcm_tail: vec![0.0f32; 240 * channels],
+            prev_pcm_tail: FixedVec::from_value(0.0f32, 240 * channels),
         })
     }
 
@@ -836,12 +869,12 @@ impl OpusDecoder {
 
         let code = toc & 0x03;
         let frame_count: usize;
-        let frame_payloads: Vec<&[u8]>;
+        let frame_payloads: FixedVec<&[u8], OPUS_MAX_PACKET_FRAMES>;
 
         match code {
             0 => {
                 frame_count = 1;
-                frame_payloads = vec![&input[1..]];
+                frame_payloads = FixedVec::from_slice(&[&input[1..]]);
             }
             1 => {
                 frame_count = 2;
@@ -855,7 +888,7 @@ impl OpusDecoder {
                 if half == 0 {
                     return Err("Code 1: empty frame");
                 }
-                frame_payloads = vec![&input[1..1 + half], &input[1 + half..]];
+                frame_payloads = FixedVec::from_slice(&[&input[1..1 + half], &input[1 + half..]]);
             }
             2 => {
                 frame_count = 2;
@@ -867,10 +900,10 @@ impl OpusDecoder {
                 if header_size + first_len > data.len() {
                     return Err("Code 2: first frame size exceeds packet");
                 }
-                frame_payloads = vec![
+                frame_payloads = FixedVec::from_slice(&[
                     &data[header_size..header_size + first_len],
                     &data[header_size + first_len..],
-                ];
+                ]);
             }
             3 => {
                 if input.len() < 2 {
@@ -912,7 +945,7 @@ impl OpusDecoder {
                 let payload_end = input.len() - pad_len;
                 let payload = &input[ptr..payload_end];
 
-                let mut payloads: Vec<&[u8]> = Vec::with_capacity(frame_count);
+                let mut payloads: FixedVec<&[u8], OPUS_MAX_PACKET_FRAMES> = FixedVec::new();
                 if frame_count == 1 {
                     // Single frame: the entire payload region is the frame, both
                     // for VBR and CBR (no length prefix is present).
@@ -1015,7 +1048,8 @@ impl OpusDecoder {
             let internal_rate = self.prev_internal_rate;
             let plc_internal_len = (10 * internal_rate / 1000) as usize;
             let mut plc_rc = RangeCoder::new_decoder(&[]);
-            let mut plc_i16 = vec![0i16; plc_internal_len * self.channels];
+            let mut plc_i16: FixedVec<i16, OPUS_PCM_I16> =
+                FixedVec::from_value(0i16, plc_internal_len * self.channels);
             let n = self.silk_dec.decode(
                 &mut plc_rc,
                 &mut plc_i16,
@@ -1044,7 +1078,7 @@ impl OpusDecoder {
                     let ratio = self.sampling_rate as f64 / internal_rate as f64;
                     let out_len = ((n as f64 * ratio) as usize).min(f5_bridge);
                     let n_us = n as usize;
-                    let mut resampled = vec![0i16; out_len];
+                    let mut resampled: FixedVec<i16, OPUS_MAX_FRAME> = FixedVec::from_value(0i16, out_len);
                     self.silk_resampler.process(
                         &mut resampled,
                         &plc_i16[..n_us],
@@ -1394,7 +1428,7 @@ impl OpusDecoder {
             // First F2_5: pure bridging audio from previous frame's tail.
             output[..f2_5_ch].copy_from_slice(&self.prev_pcm_tail[..f2_5_ch]);
             // Next F2_5: crossfade bridge → new CELT output.
-            let new_mid: Vec<f32> = output[f2_5_ch..f5_ch].to_vec();
+            let new_mid: FixedVec<f32, OPUS_PCM_TAIL> = FixedVec::from_slice(&output[f2_5_ch..f5_ch]);
             smooth_fade(
                 &self.prev_pcm_tail[f2_5_ch..f5_ch],
                 &new_mid,
@@ -1624,7 +1658,7 @@ fn parse_frame_size(data: &[u8]) -> Result<(usize, usize), &'static str> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 

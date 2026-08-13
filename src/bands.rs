@@ -4,6 +4,9 @@ use crate::range_coder::RangeCoder;
 use crate::rate::{BITRES, bits2pulses, get_pulses, pulses2bits};
 use crate::tell_frac_inline;
 
+#[cfg(not(feature = "std"))]
+use crate::compat::Math;
+
 const MIN_STEREO_ENERGY: f32 = 1e-10;
 
 pub struct BandCtx<'a> {
@@ -206,7 +209,7 @@ pub fn haar1(x: &mut [f32], n0: usize, stride: usize) {
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
-        if stride == 1 && n0 >= 16 && is_x86_feature_detected!("avx") {
+        if stride == 1 && n0 >= 16 && crate::compat::x86_has_avx() {
             haar1_avx(x, n0);
             return;
         }
@@ -218,9 +221,9 @@ pub fn haar1(x: &mut [f32], n0: usize, stride: usize) {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
 unsafe fn haar1_avx(x: &mut [f32], n0: usize) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
     let n = n0 >> 1;
-    let scale = _mm256_set1_ps(std::f32::consts::FRAC_1_SQRT_2);
+    let scale = _mm256_set1_ps(core::f32::consts::FRAC_1_SQRT_2);
     let mut j = 0;
     while j + 8 <= n {
         let ptr = x.as_mut_ptr().add(2 * j);
@@ -247,7 +250,7 @@ unsafe fn haar1_avx(x: &mut [f32], n0: usize) {
         j += 8;
     }
 
-    let scale = std::f32::consts::FRAC_1_SQRT_2;
+    let scale = core::f32::consts::FRAC_1_SQRT_2;
     while j < n {
         let idx1 = 2 * j;
         let idx2 = 2 * j + 1;
@@ -263,7 +266,7 @@ unsafe fn haar1_avx(x: &mut [f32], n0: usize) {
 #[inline]
 fn haar1_scalar(x: &mut [f32], n0: usize, stride: usize) {
     let n = n0 >> 1;
-    let scale = std::f32::consts::FRAC_1_SQRT_2;
+    let scale = core::f32::consts::FRAC_1_SQRT_2;
     for i in 0..stride {
         for j in 0..n {
             let idx1 = stride * 2 * j + i;
@@ -278,10 +281,10 @@ fn haar1_scalar(x: &mut [f32], n0: usize, stride: usize) {
 
 #[cfg(target_arch = "aarch64")]
 fn haar1_neon(x: &mut [f32], n0: usize) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let n = n0 >> 1;
-    let scale = std::f32::consts::FRAC_1_SQRT_2;
+    let scale = core::f32::consts::FRAC_1_SQRT_2;
 
     unsafe {
         let vscale = vdupq_n_f32(scale);
@@ -342,7 +345,7 @@ pub fn compute_qn(n: usize, b: i32, offset: i32, pulse_cap: i32, stereo: bool) -
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn stereo_itheta_neon(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let mut emid = 1e-15f32;
     let mut eside = 1e-15f32;
@@ -526,7 +529,7 @@ pub fn stereo_itheta(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
 fn celt_atan2p_norm(y: f32, x: f32) -> f32 {
     #[inline(always)]
     fn atan_norm(x: f32) -> f32 {
-        const ATAN2_2_OVER_PI: f32 = std::f32::consts::FRAC_2_PI;
+        const ATAN2_2_OVER_PI: f32 = core::f32::consts::FRAC_2_PI;
         const A03: f32 = -3.333_166e-1_f32;
         const A05: f32 = 1.996_270_4e-1_f32;
         const A07: f32 = -1.397_658_3e-1_f32;
@@ -697,8 +700,8 @@ pub fn compute_theta(
             let (bx, by) = (x.as_ptr() as *mut f32, y.as_ptr() as *mut f32);
             let (sx, sy) = unsafe {
                 (
-                    std::slice::from_raw_parts_mut(bx, n),
-                    std::slice::from_raw_parts_mut(by, n),
+                    core::slice::from_raw_parts_mut(bx, n),
+                    core::slice::from_raw_parts_mut(by, n),
                 )
             };
             if itheta == 0 {
@@ -713,8 +716,8 @@ pub fn compute_theta(
             let (bx, by) = (x.as_ptr() as *mut f32, y.as_ptr() as *mut f32);
             let (sx, sy) = unsafe {
                 (
-                    std::slice::from_raw_parts_mut(bx, n),
-                    std::slice::from_raw_parts_mut(by, n),
+                    core::slice::from_raw_parts_mut(bx, n),
+                    core::slice::from_raw_parts_mut(by, n),
                 )
             };
             if inv {
@@ -1359,7 +1362,7 @@ pub fn quant_partition(
                 } else if let Some(lb) = lowband {
                     #[cfg(target_arch = "aarch64")]
                     unsafe {
-                        use std::arch::aarch64::*;
+                        use core::arch::aarch64::*;
                         let n8 = n & !7;
                         let mut i = 0;
                         while i < n8 {
@@ -1424,8 +1427,8 @@ pub fn quant_partition(
 #[inline(always)]
 unsafe fn deinterleave_hadamard_neon(x: &mut [f32], n0: usize, stride: usize) {
     let n = n0 * stride;
-    let mut tmp_buf = [std::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let tmp = std::slice::from_raw_parts_mut(tmp_buf.as_mut_ptr() as *mut f32, n);
+    let mut tmp_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
+    let tmp = core::slice::from_raw_parts_mut(tmp_buf.as_mut_ptr() as *mut f32, n);
 
     for i in 0..stride {
         let src_offset = i;
@@ -1441,9 +1444,9 @@ unsafe fn deinterleave_hadamard_neon(x: &mut [f32], n0: usize, stride: usize) {
 pub fn deinterleave_hadamard(x: &mut [f32], n0: usize, stride: usize, hadamard: bool) {
     let n = n0 * stride;
 
-    let mut tmp_buf = [std::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
+    let mut tmp_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
 
-    let tmp = unsafe { std::slice::from_raw_parts_mut(tmp_buf.as_mut_ptr() as *mut f32, n) };
+    let tmp = unsafe { core::slice::from_raw_parts_mut(tmp_buf.as_mut_ptr() as *mut f32, n) };
     if hadamard {
         let offset = match stride {
             2 => 0,
@@ -1479,8 +1482,8 @@ pub fn deinterleave_hadamard(x: &mut [f32], n0: usize, stride: usize, hadamard: 
 #[inline(always)]
 unsafe fn interleave_hadamard_neon(x: &mut [f32], n0: usize, stride: usize) {
     let n = n0 * stride;
-    let mut tmp_buf = [std::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let tmp = std::slice::from_raw_parts_mut(tmp_buf.as_mut_ptr() as *mut f32, n);
+    let mut tmp_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
+    let tmp = core::slice::from_raw_parts_mut(tmp_buf.as_mut_ptr() as *mut f32, n);
 
     for i in 0..stride {
         let src_offset = i * n0;
@@ -1495,8 +1498,8 @@ unsafe fn interleave_hadamard_neon(x: &mut [f32], n0: usize, stride: usize) {
 
 pub fn interleave_hadamard(x: &mut [f32], n0: usize, stride: usize, hadamard: bool) {
     let n = n0 * stride;
-    let mut tmp_buf = [std::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
-    let tmp = unsafe { std::slice::from_raw_parts_mut(tmp_buf.as_mut_ptr() as *mut f32, n) };
+    let mut tmp_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
+    let tmp = unsafe { core::slice::from_raw_parts_mut(tmp_buf.as_mut_ptr() as *mut f32, n) };
     if hadamard {
         let offset = match stride {
             2 => 0,
@@ -1739,7 +1742,7 @@ pub fn stereo_merge(x: &mut [f32], y: &mut [f32], mid: f32, _side: f32, n: usize
 
 #[inline(always)]
 fn stereo_split(x: &mut [f32], y: &mut [f32], n: usize) {
-    let scale = std::f32::consts::FRAC_1_SQRT_2;
+    let scale = core::f32::consts::FRAC_1_SQRT_2;
     for i in 0..n {
         let l = scale * x[i];
         let r = scale * y[i];
@@ -1816,9 +1819,9 @@ fn prepare_lowband_views(
 
     if allow_lowband_scratch {
         unsafe {
-            std::ptr::copy_nonoverlapping(norm.as_ptr().add(lb_start), lowband_scratch_ptr, n)
+            core::ptr::copy_nonoverlapping(norm.as_ptr().add(lb_start), lowband_scratch_ptr, n)
         };
-        let lb = Some(unsafe { std::slice::from_raw_parts_mut(lowband_scratch_ptr, n) });
+        let lb = Some(unsafe { core::slice::from_raw_parts_mut(lowband_scratch_ptr, n) });
         let lb_out = out_range.map(|(s, e)| &mut norm[s..e]);
         return (lb, lb_out);
     }
@@ -1846,7 +1849,7 @@ fn prepare_lowband_views(
 #[target_feature(enable = "avx2")]
 #[allow(dead_code)]
 unsafe fn stereo_merge_avx2(x: &mut [f32], y: &mut [f32], mid: f32, side: f32, n: usize) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let mut i = 0;
 
@@ -1915,7 +1918,7 @@ fn stereo_merge_scalar(x: &mut [f32], y: &mut [f32], mid: f32, side: f32, n: usi
 #[cfg(target_arch = "aarch64")]
 #[allow(dead_code)]
 fn stereo_merge_neon(x: &mut [f32], y: &mut [f32], mid: f32, side: f32, n: usize) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     unsafe {
         let vmid = vdupq_n_f32(mid);
@@ -2228,14 +2231,14 @@ pub fn quant_all_bands(
     const MAX_NORM_SIZE: usize = 800;
     debug_assert!(norm_size <= MAX_NORM_SIZE);
 
-    let mut norm_buf = [std::mem::MaybeUninit::<f32>::uninit(); MAX_NORM_SIZE];
+    let mut norm_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_NORM_SIZE];
     let norm =
-        unsafe { std::slice::from_raw_parts_mut(norm_buf.as_mut_ptr() as *mut f32, norm_size) };
-    let mut norm2_buf = [std::mem::MaybeUninit::<f32>::uninit(); MAX_NORM_SIZE];
+        unsafe { core::slice::from_raw_parts_mut(norm_buf.as_mut_ptr() as *mut f32, norm_size) };
+    let mut norm2_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_NORM_SIZE];
     let norm2 =
-        unsafe { std::slice::from_raw_parts_mut(norm2_buf.as_mut_ptr() as *mut f32, norm_size) };
+        unsafe { core::slice::from_raw_parts_mut(norm2_buf.as_mut_ptr() as *mut f32, norm_size) };
 
-    let mut lowband_scratch_buf = [std::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
+    let mut lowband_scratch_buf = [core::mem::MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
     let lowband_scratch_ptr = lowband_scratch_buf.as_mut_ptr() as *mut f32;
 
     let mut lowband_offset: usize = 0;
@@ -2457,7 +2460,7 @@ pub fn quant_all_bands(
 
 #[cfg(target_arch = "aarch64")]
 fn compute_band_energy_neon(band: &[f32]) -> f32 {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let n = band.len();
     let mut sum = 1e-27f32;
@@ -2510,7 +2513,7 @@ fn compute_band_energy_neon(band: &[f32]) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn compute_band_energy_avx2(band: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let n = band.len();
     let mut i = 0usize;
@@ -2559,7 +2562,7 @@ pub fn compute_band_energies(
     let frame_size = m.short_mdct_size << lm;
 
     #[cfg(target_arch = "x86_64")]
-    let use_avx2 = std::arch::is_x86_feature_detected!("avx2");
+    let use_avx2 = crate::compat::x86_has_avx2();
 
     for c in 0..channels {
         let ch = &x[c * frame_size..(c + 1) * frame_size];
@@ -2629,7 +2632,7 @@ pub fn normalise_bands(
     let lm = m_val.trailing_zeros() as usize;
     let frame_size = m.short_mdct_size << lm;
     #[cfg(target_arch = "x86_64")]
-    let use_avx2 = std::arch::is_x86_feature_detected!("avx2");
+    let use_avx2 = crate::compat::x86_has_avx2();
     for c in 0..channels {
         for i in 0..end {
             let base = c * frame_size + ((m.e_bands[i] as usize) << lm);
@@ -2657,7 +2660,7 @@ pub fn normalise_bands(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn scale_slice_avx2(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
     let vscale = _mm256_set1_ps(scale);
     let mut i = 0;
 
@@ -2682,7 +2685,7 @@ unsafe fn scale_slice_avx2(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn scale_slice_neon(src: &[f32], dst: &mut [f32], scale: f32, n: usize) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
     let vscale = vdupq_n_f32(scale);
     let mut i = 0;
 
@@ -2728,7 +2731,7 @@ pub fn denormalise_bands(
     let lm = m_val.trailing_zeros() as usize;
     let frame_size = m.short_mdct_size << lm;
     #[cfg(target_arch = "x86_64")]
-    let use_avx2 = std::arch::is_x86_feature_detected!("avx2");
+    let use_avx2 = crate::compat::x86_has_avx2();
 
     for c in 0..channels {
         for i in start..end {
@@ -2765,7 +2768,7 @@ pub fn celt_lcg_rand(seed: u32) -> u32 {
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let mut sum_vec = vdupq_n_f32(0.0);
     let mut i = 0;
@@ -2840,7 +2843,7 @@ unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let mut i = 0usize;
 
@@ -2902,7 +2905,7 @@ pub fn renormalise_vector(x: &mut [f32], n: usize, gain: f32) {
     }
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        if n >= 16 && std::arch::is_x86_feature_detected!("avx2") {
+        if n >= 16 && crate::compat::x86_has_avx2() {
             renormalise_vector_avx2(x, n, gain);
             return;
         }
@@ -2976,7 +2979,7 @@ pub fn anti_collapse(
 
             let mut r = 2.0 * (-e_diff).exp2();
             if lm == 3 {
-                r *= std::f32::consts::SQRT_2;
+                r *= core::f32::consts::SQRT_2;
             }
             r = r.min(thresh);
             r *= sqrt_1;
@@ -3000,7 +3003,7 @@ pub fn anti_collapse(
     seed
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 

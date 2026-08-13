@@ -1,21 +1,31 @@
 use crate::kiss_fft::{KissCpx, KissFftState, opus_fft_impl};
-use std::f32::consts::PI;
-use std::mem::MaybeUninit;
+use core::f32::consts::PI;
+use core::mem::MaybeUninit;
+
+#[cfg(not(feature = "std"))]
+use crate::compat::Math;
+use crate::fixedvec::FixedVec;
 
 const MAX_N2: usize = 960;
 const MAX_N4: usize = 480;
+/// Maximum number of MDCT levels (`max_lm`). The default 48 kHz / 960 mode uses 3;
+/// 4 leaves headroom for hybrid modes.
+const MDCT_MAX_LM: usize = 4;
+/// Bounded by the geometric sum of `n2` across all levels: `n/2 + n/4 + ... <= n`.
+const MDCT_TRIG_MAX: usize = 2 * MAX_N2;
 
 pub struct MdctLookup {
     pub n: usize,
     pub max_lm: usize,
-    kfft: Vec<Option<KissFftState>>,
-    trig: Vec<f32>,
+    kfft: FixedVec<Option<KissFftState>, { MDCT_MAX_LM + 1 }>,
+    trig: FixedVec<f32, MDCT_TRIG_MAX>,
 }
 
 impl MdctLookup {
     pub fn new(n: usize, max_lm: usize) -> Self {
-        let mut kfft = Vec::new();
-        let mut trig = Vec::new();
+        debug_assert!(max_lm <= MDCT_MAX_LM);
+        let mut kfft: FixedVec<Option<KissFftState>, { MDCT_MAX_LM + 1 }> = FixedVec::new();
+        let mut trig: FixedVec<f32, MDCT_TRIG_MAX> = FixedVec::new();
         let mut curr_n = n;
 
         for shift in 0..=max_lm {
@@ -85,8 +95,8 @@ impl MdctLookup {
         let mut f_buf = [MaybeUninit::<f32>::uninit(); MAX_N2];
         let mut f2_buf = [MaybeUninit::<KissCpx>::uninit(); MAX_N4];
 
-        let f = unsafe { std::slice::from_raw_parts_mut(f_buf.as_mut_ptr() as *mut f32, n2) };
-        let f2 = unsafe { std::slice::from_raw_parts_mut(f2_buf.as_mut_ptr() as *mut KissCpx, n4) };
+        let f = unsafe { core::slice::from_raw_parts_mut(f_buf.as_mut_ptr() as *mut f32, n2) };
+        let f2 = unsafe { core::slice::from_raw_parts_mut(f2_buf.as_mut_ptr() as *mut KissCpx, n4) };
 
         assert!(input.len() >= n2 + overlap2);
         assert!(window.len() >= overlap);
@@ -157,7 +167,7 @@ impl MdctLookup {
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         unsafe {
-            if std::arch::is_x86_feature_detected!("avx") {
+            if crate::compat::x86_has_avx() {
                 mdct_pre_rotation_avx(f, f2, trig, &st.bitrev[..n4], n4, scale);
             } else {
                 for i in 0..n4 {
@@ -200,7 +210,7 @@ impl MdctLookup {
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         unsafe {
-            if std::arch::is_x86_feature_detected!("avx") {
+            if crate::compat::x86_has_avx() {
                 mdct_post_rotation_avx(f2, trig, output, n4, n2, stride);
             } else {
                 for i in 0..n4 {
@@ -262,11 +272,11 @@ impl MdctLookup {
 
         let mut f2_buf = [MaybeUninit::<KissCpx>::uninit(); MAX_N4];
 
-        let f2 = unsafe { std::slice::from_raw_parts_mut(f2_buf.as_mut_ptr() as *mut KissCpx, n4) };
+        let f2 = unsafe { core::slice::from_raw_parts_mut(f2_buf.as_mut_ptr() as *mut KissCpx, n4) };
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         unsafe {
-            if std::arch::is_x86_feature_detected!("avx") {
+            if crate::compat::x86_has_avx() {
                 mdct_backward_pre_rotation_avx(input, f2, trig, &st.bitrev[..n4], n4, n2, stride);
             } else {
                 for i in 0..n4 {
@@ -313,7 +323,7 @@ impl MdctLookup {
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         unsafe {
-            if std::arch::is_x86_feature_detected!("avx") {
+            if crate::compat::x86_has_avx() {
                 mdct_backward_post_rotation_avx(f2, trig, output, n4, n2, overlap2);
             } else {
                 for i in 0..((n4 + 1) >> 1) {
@@ -378,7 +388,7 @@ impl MdctLookup {
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         unsafe {
-            if std::arch::is_x86_feature_detected!("avx") {
+            if crate::compat::x86_has_avx() {
                 mdct_tdac_avx(output, window, overlap);
             } else {
                 for i in 0..overlap2 {
@@ -524,7 +534,7 @@ unsafe fn mdct_backward_post_rotation_avx(
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
 unsafe fn mdct_tdac_avx(output: &mut [f32], window: &[f32], overlap: usize) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let overlap2 = overlap / 2;
     let mut i = 0usize;
@@ -577,7 +587,7 @@ fn mdct_pre_rotation_neon(
     n4: usize,
     scale: f32,
 ) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     unsafe {
         let vscale = vdupq_n_f32(scale);
@@ -606,8 +616,8 @@ fn mdct_pre_rotation_neon(
             let yr = vmulq_f32(yr, vscale);
             let yi = vmulq_f32(yi, vscale);
 
-            let yr_arr: [f32; 4] = std::mem::transmute(yr);
-            let yi_arr: [f32; 4] = std::mem::transmute(yi);
+            let yr_arr: [f32; 4] = core::mem::transmute(yr);
+            let yi_arr: [f32; 4] = core::mem::transmute(yi);
 
             for j in 0..4 {
                 let rev = *bitrev_ptr.add(i + j) as usize;
@@ -642,7 +652,7 @@ fn mdct_post_rotation_neon(
     n2: usize,
     stride: usize,
 ) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     if stride > 1 {
         for i in 0..n4 {
@@ -680,8 +690,8 @@ fn mdct_post_rotation_neon(
 
             let yi = vaddq_f32(vmulq_f32(r_v, t1), vmulq_f32(i_v, t0));
 
-            let yr_arr: [f32; 4] = std::mem::transmute(yr);
-            let yi_arr: [f32; 4] = std::mem::transmute(yi);
+            let yr_arr: [f32; 4] = core::mem::transmute(yr);
+            let yi_arr: [f32; 4] = core::mem::transmute(yi);
 
             for j in 0..4 {
                 *out_ptr.add((i + j) * 2) = yr_arr[j];
@@ -714,7 +724,7 @@ fn mdct_backward_pre_rotation_neon(
     n2: usize,
     stride: usize,
 ) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     if stride != 1 {
         for i in 0..n4 {
@@ -759,8 +769,8 @@ fn mdct_backward_pre_rotation_neon(
             let yr = vaddq_f32(vmulq_f32(x2_v, t0), vmulq_f32(x1_v, t1));
             let yi = vsubq_f32(vmulq_f32(x1_v, t0), vmulq_f32(x2_v, t1));
 
-            let yr_arr: [f32; 4] = std::mem::transmute(yr);
-            let yi_arr: [f32; 4] = std::mem::transmute(yi);
+            let yr_arr: [f32; 4] = core::mem::transmute(yr);
+            let yi_arr: [f32; 4] = core::mem::transmute(yi);
 
             for j in 0..4 {
                 let rev = *bitrev_ptr.add(i + j) as usize;
@@ -874,7 +884,7 @@ fn mdct_backward_post_rotation_neon(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn mdct_tdac_neon(output: &mut [f32], window: &[f32], overlap: usize) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let overlap2 = overlap / 2;
     if overlap2 < 4 {
@@ -930,7 +940,7 @@ fn mdct_tdac_neon(output: &mut [f32], window: &[f32], overlap: usize) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod mdct_tests {
     #[test]
     fn test_mdct_backward_transient_no_blowup() {

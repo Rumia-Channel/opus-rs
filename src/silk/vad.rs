@@ -11,7 +11,7 @@ use crate::silk::macros::{
 };
 use crate::silk::sigm::silk_sigm_q15;
 use crate::silk::structs::{SilkEncoderState, SilkVADState};
-use std::cmp::{max, min};
+use core::cmp::{max, min};
 
 const TILT_WEIGHTS: [i32; VAD_N_BANDS] = [30000, 6000, -12000, -12000];
 

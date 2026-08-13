@@ -134,7 +134,7 @@ unsafe fn silk_lpc_prediction_neon(
     a_q12: &[i16],
     predict_lpc_order: i32,
 ) -> i32 {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let order = predict_lpc_order as usize;
     let lpc_base = ps_lpc_q14.as_ptr().add(idx);

@@ -6,6 +6,9 @@ use crate::silk::sigproc_fix::*;
 use crate::silk::structs::*;
 use crate::silk::tuning_parameters::*;
 
+#[cfg(not(feature = "std"))]
+use crate::compat::Math;
+
 pub fn silk_find_lpc_fix(
     ps_enc_c: &mut SilkEncoderStateCommon,
     nlsf_q15: &mut [i16],

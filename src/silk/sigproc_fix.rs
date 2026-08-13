@@ -148,7 +148,7 @@ fn xcorr_kernel_c(x: &[i16], y: &[i16], sum: &mut [i32; 4], len: usize) {
         }
     }
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") {
+    if crate::compat::x86_has_avx2() {
         unsafe { xcorr_kernel_avx2(x, y, sum, len) };
         return;
     }
@@ -232,7 +232,7 @@ fn xcorr_kernel_scalar(x: &[i16], y: &[i16], sum: &mut [i32; 4], len: usize) {
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn xcorr_kernel_neon_s16(x: &[i16], y: &[i16], sum: &mut [i32; 4], mut len: usize) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     debug_assert!(x.len() >= len);
     debug_assert!(y.len() >= len + 3);
@@ -423,7 +423,7 @@ pub fn silk_sum_sqr_shift(energy: &mut i32, shift: &mut i32, x: &[i16], len: usi
         nrg = unsafe { silk_sum_sqr_shift_neon(x, len, shft) };
     }
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") {
+    if crate::compat::x86_has_avx2() {
         nrg = unsafe { silk_sum_sqr_shift_avx2(x, len, shft) };
     } else {
         nrg = 0;
@@ -463,7 +463,7 @@ pub fn silk_sum_sqr_shift(energy: &mut i32, shift: &mut i32, x: &[i16], len: usi
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn silk_sum_sqr_shift_neon(x: &[i16], len: usize, shft: i32) -> i32 {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let mut acc = vdupq_n_s64(0i64);
     let mut i = 0;
@@ -502,7 +502,7 @@ pub fn silk_inner_prod_aligned(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
         silk_inner_prod_aligned_neon(ptr1, ptr2, len)
     }
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") {
+    if crate::compat::x86_has_avx2() {
         return unsafe { silk_inner_prod_aligned_avx2(ptr1, ptr2, len) };
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -543,7 +543,7 @@ fn silk_inner_prod_aligned_scalar(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn silk_inner_prod_aligned_neon(ptr1: &[i16], ptr2: &[i16], len: usize) -> i32 {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let mut acc0 = vdupq_n_s32(0i32);
     let mut acc1 = vdupq_n_s32(0i32);
@@ -921,7 +921,7 @@ pub fn silk_lpc_analysis_filter(
     assert!(d <= len);
 
     #[cfg(target_arch = "x86_64")]
-    if d <= 16 && is_x86_feature_detected!("avx2") {
+    if d <= 16 && crate::compat::x86_has_avx2() {
         unsafe {
             silk_lpc_analysis_filter_avx2(out, input, b, len, d);
         }
@@ -1063,7 +1063,7 @@ pub fn silk_shr32(a: i32, shift: i32) -> i32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
+use core::arch::x86_64::*;
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -1278,7 +1278,7 @@ unsafe fn silk_biquad_alt_stride2_neon(
     s: &mut [i32],
     len: usize,
 ) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let offset_s32x2 = vdup_n_s32((1 << 14) - 1);
     let offset_s32x4 = vcombine_s32(offset_s32x2, offset_s32x2);
@@ -1404,7 +1404,7 @@ unsafe fn silk_biquad_alt_stride2_neon(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 

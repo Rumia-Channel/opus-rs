@@ -1,8 +1,11 @@
 use crate::silk::biquad_alt::{silk_biquad_alt_stride1, silk_biquad_alt_stride2};
 use crate::silk::macros::*;
 
+#[cfg(not(feature = "std"))]
+use crate::compat::Math;
+
 const SILK_FIX_CONST_19: i32 =
-    ((1.5 * std::f64::consts::PI / 1000.0) * (1 << 19) as f64 + 0.5) as i32;
+    ((1.5 * core::f64::consts::PI / 1000.0) * (1 << 19) as f64 + 0.5) as i32;
 
 pub fn hp_cutoff(
     input: &[f32],

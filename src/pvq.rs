@@ -1,5 +1,8 @@
 use crate::range_coder::RangeCoder;
-use std::mem::MaybeUninit;
+use core::mem::MaybeUninit;
+
+#[cfg(not(feature = "std"))]
+use crate::compat::Math;
 
 pub const CELT_PVQ_U_DATA: [u32; 1272] = [
     1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -510,7 +513,7 @@ fn pvq_search_n4(x: &[f32], y: &mut [i32], k: i32) {
 
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        use std::arch::x86_64::*;
+        use core::arch::x86_64::*;
 
         let sign_mask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFF_FFFFu32 as i32));
         let vx = _mm_loadu_ps(x.as_ptr());
@@ -714,7 +717,7 @@ pub fn pvq_search(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     }
 
     #[cfg(target_arch = "x86_64")]
-    if k > 4 && std::arch::is_x86_feature_detected!("avx2") {
+    if k > 4 && crate::compat::x86_has_avx2() {
         unsafe {
             pvq_search_avx2(x, y, k, n);
         }
@@ -733,7 +736,7 @@ unsafe fn pvq_fast_select_init_neon(
     abs_x: &mut [MaybeUninit<f32>; MAX_PVQ_N],
     signs: &mut [MaybeUninit<i32>; MAX_PVQ_N],
 ) -> f32 {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let mut sum_vec = vdupq_n_f32(0.0);
     let mut i = 0;
@@ -839,8 +842,8 @@ pub fn pvq_search_fast_select(x: &[f32], y: &mut [i32], k: i32, n: usize) -> f32
         s
     };
 
-    let abs_x = unsafe { std::slice::from_raw_parts(abs_x_mu.as_ptr() as *const f32, n) };
-    let signs = unsafe { std::slice::from_raw_parts(signs_mu.as_ptr() as *const i32, n) };
+    let abs_x = unsafe { core::slice::from_raw_parts(abs_x_mu.as_ptr() as *const f32, n) };
+    let signs = unsafe { core::slice::from_raw_parts(signs_mu.as_ptr() as *const i32, n) };
 
     if k > (n >> 1) as i32 && sum > 1e-15 {
         let rcp = (k as f32 + 0.8) / sum;
@@ -873,13 +876,13 @@ pub fn pvq_search_fast_select(x: &[f32], y: &mut [i32], k: i32, n: usize) -> f32
     if k < BATCH_SIZE * 2 || n < 16 {
         #[cfg(target_arch = "aarch64")]
         {
-            use std::arch::aarch64::*;
+            use core::arch::aarch64::*;
             let mut y2f_mu = [MaybeUninit::<f32>::uninit(); MAX_PVQ_N];
             for i in 0..n {
                 y2f_mu[i].write(2.0 * y[i] as f32);
             }
             let y2f = unsafe {
-                std::slice::from_raw_parts_mut(y2f_mu.as_mut_ptr() as *mut f32, MAX_PVQ_N)
+                core::slice::from_raw_parts_mut(y2f_mu.as_mut_ptr() as *mut f32, MAX_PVQ_N)
             };
 
             let abs_x_ptr = abs_x.as_ptr();
@@ -903,7 +906,7 @@ pub fn pvq_search_fast_select(x: &[f32], y: &mut [i32], k: i32, n: usize) -> f32
                         let inv_sqrt = vrsqrteq_f32(ryy);
                         let score = vmulq_f32(rxy, inv_sqrt);
                         vmax = vmaxq_f32(vmax, score);
-                        let sc = std::slice::from_raw_parts(
+                        let sc = core::slice::from_raw_parts(
                             &score as *const float32x4_t as *const f32,
                             4,
                         );
@@ -995,7 +998,7 @@ pub fn pvq_search_fast_select(x: &[f32], y: &mut [i32], k: i32, n: usize) -> f32
             }
         }
         let y2f =
-            unsafe { std::slice::from_raw_parts_mut(y2f_mu.as_mut_ptr() as *mut f32, MAX_PVQ_N) };
+            unsafe { core::slice::from_raw_parts_mut(y2f_mu.as_mut_ptr() as *mut f32, MAX_PVQ_N) };
         let mut scores_mu = [MaybeUninit::<(f32, usize)>::uninit(); MAX_PVQ_N];
 
         let abs_x_ptr = abs_x.as_ptr();
@@ -1013,18 +1016,18 @@ pub fn pvq_search_fast_select(x: &[f32], y: &mut [i32], k: i32, n: usize) -> f32
             }
 
             let scores = unsafe {
-                std::slice::from_raw_parts_mut(scores_mu.as_mut_ptr() as *mut (f32, usize), n)
+                core::slice::from_raw_parts_mut(scores_mu.as_mut_ptr() as *mut (f32, usize), n)
             };
 
             let pos = batch as usize;
 
             scores.select_nth_unstable_by(pos, |a, b| {
                 if a.0 > b.0 {
-                    std::cmp::Ordering::Less
+                    core::cmp::Ordering::Less
                 } else if a.0 < b.0 {
-                    std::cmp::Ordering::Greater
+                    core::cmp::Ordering::Greater
                 } else {
-                    std::cmp::Ordering::Equal
+                    core::cmp::Ordering::Equal
                 }
             });
 
@@ -1061,7 +1064,7 @@ unsafe fn pvq_search_scalar_init_neon(
     abs_x: &mut [f32; 32],
     sign_x: &mut [i32; 32],
 ) -> f32 {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let mut sum_vec = vdupq_n_f32(0.0);
     let mut i = 0;
@@ -1247,7 +1250,7 @@ fn pvq_search_scalar(x: &[f32], y: &mut [i32], k: i32, n: usize) {
     let sum = unsafe { pvq_search_scalar_init_neon(x, n, &mut abs_x, &mut sign_x) };
     #[cfg(all(not(target_arch = "aarch64"), target_arch = "x86_64"))]
     let sum = unsafe {
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if crate::compat::x86_has_avx2() {
             pvq_search_scalar_init_avx2(x, n, &mut abs_x, &mut sign_x)
         } else {
             let mut s = 0.0f32;
@@ -1349,7 +1352,7 @@ fn pvq_search_scalar(x: &[f32], y: &mut [i32], k: i32, n: usize) {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn pvq_search_neon(x: &[f32], y: &mut [i32], k: i32, n: usize) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     debug_assert!(n <= 16);
     let mut k = k;
@@ -1459,9 +1462,9 @@ fn pvq_search_neon(x: &[f32], y: &mut [i32], k: i32, n: usize) {
         sign_x_mu[i].write((xi < 0.0) as i32);
     }
 
-    let abs_x = unsafe { std::slice::from_raw_parts_mut(abs_x_mu.as_mut_ptr() as *mut f32, 20) };
-    let y2f = unsafe { std::slice::from_raw_parts_mut(y2f_mu.as_mut_ptr() as *mut f32, 20) };
-    let sign_x = unsafe { std::slice::from_raw_parts_mut(sign_x_mu.as_mut_ptr() as *mut i32, 16) };
+    let abs_x = unsafe { core::slice::from_raw_parts_mut(abs_x_mu.as_mut_ptr() as *mut f32, 20) };
+    let y2f = unsafe { core::slice::from_raw_parts_mut(y2f_mu.as_mut_ptr() as *mut f32, 20) };
+    let sign_x = unsafe { core::slice::from_raw_parts_mut(sign_x_mu.as_mut_ptr() as *mut i32, 16) };
 
     let ran_presearch = k > (n >> 1) as i32 && sum > 1e-15;
     if ran_presearch {
@@ -1540,7 +1543,7 @@ fn pvq_search_neon(x: &[f32], y: &mut [i32], k: i32, n: usize) {
                 let inv_sqrt = vrsqrteq_f32(ryy);
                 let score = vmulq_f32(rxy, inv_sqrt);
                 vmax = vmaxq_f32(vmax, score);
-                let sc = std::slice::from_raw_parts(&score as *const float32x4_t as *const f32, 4);
+                let sc = core::slice::from_raw_parts(&score as *const float32x4_t as *const f32, 4);
                 let mx = vmaxvq_f32(vmax);
                 for lane in 0..4 {
                     if sc[lane] == mx {
@@ -1583,7 +1586,7 @@ fn pvq_search_neon(x: &[f32], y: &mut [i32], k: i32, n: usize) {
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn pvq_search_avx2(x: &[f32], y: &mut [i32], k: i32, n: usize) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     debug_assert!(n <= 31);
     debug_assert!(k > 4);
@@ -1798,7 +1801,7 @@ unsafe fn exp_rotation1_neon(x: &mut [f32], len: usize, stride: usize, c: f32, s
         return;
     }
 
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let vc = vdupq_n_f32(c);
     let vs = vdupq_n_f32(s);
@@ -1845,8 +1848,8 @@ pub fn exp_rotation(x: &mut [f32], length: usize, dir: i32, stride: usize, k: i3
     let factor = SPREAD_FACTOR[spread as usize - 1];
     let gain = (length as f32) / (length as f32 + factor as f32 * k as f32);
     let theta = 0.5 * gain * gain;
-    let c = (0.5 * std::f32::consts::PI * theta).cos();
-    let s = (0.5 * std::f32::consts::PI * theta).sin();
+    let c = (0.5 * core::f32::consts::PI * theta).cos();
+    let s = (0.5 * core::f32::consts::PI * theta).sin();
 
     let mut stride2 = 0;
     if length >= 8 * stride {
@@ -1878,7 +1881,7 @@ pub fn exp_rotation(x: &mut [f32], length: usize, dir: i32, stride: usize, k: i3
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn extract_collapse_mask_neon(iy: &[i32], n: usize, b: usize) -> u32 {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     if b <= 1 {
         return 1;
@@ -1954,7 +1957,7 @@ pub fn extract_collapse_mask(iy: &[i32], n: usize, b: usize) -> u32 {
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let mut acc0 = _mm256_setzero_ps();
     let mut acc1 = _mm256_setzero_ps();
@@ -2008,7 +2011,7 @@ unsafe fn renormalise_vector_avx2(x: &mut [f32], n: usize, gain: f32) {
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn alg_quant_resynth_avx2(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let mut acc0 = _mm256_setzero_ps();
     let mut i = 0;
@@ -2057,7 +2060,7 @@ unsafe fn pvq_search_scalar_init_avx2(
     abs_x: &mut [f32; 32],
     sign_x: &mut [i32; 32],
 ) -> f32 {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
     let sign_mask = _mm256_set1_ps(-0.0f32);
     let mut acc = _mm256_setzero_ps();
     let mut i = 0;
@@ -2094,7 +2097,7 @@ unsafe fn pvq_search_scalar_init_avx2(
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn renormalise_vector_neon(x: &mut [f32], n: usize, gain: f32) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let mut sum_vec = vdupq_n_f32(0.0);
     let mut i = 0;
@@ -2172,7 +2175,7 @@ pub fn renormalise_vector(x: &mut [f32], n: usize, gain: f32) {
     }
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        if n >= 8 && std::arch::is_x86_feature_detected!("avx2") {
+        if n >= 8 && crate::compat::x86_has_avx2() {
             renormalise_vector_avx2(x, n, gain);
             return;
         }
@@ -2194,7 +2197,7 @@ pub fn renormalise_vector(x: &mut [f32], n: usize, gain: f32) {
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn alg_quant_resynth_neon(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let mut sum_vec = vdupq_n_f32(0.0);
     let n8 = n & !7;
@@ -2247,7 +2250,7 @@ unsafe fn alg_quant_resynth_neon(y: &[i32], x: &mut [f32], n: usize, gain: f32) 
 fn alg_quant_resynth_scalar(y: &[i32], x: &mut [f32], n: usize, gain: f32) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if crate::compat::x86_has_avx2() {
             alg_quant_resynth_avx2(y, x, n, gain);
             return;
         }
@@ -2291,7 +2294,7 @@ pub fn alg_quant(
 ) -> u32 {
     if n <= 32 {
         let mut y_buf = [MaybeUninit::<i32>::uninit(); 32];
-        let y = unsafe { std::slice::from_raw_parts_mut(y_buf.as_mut_ptr() as *mut i32, n) };
+        let y = unsafe { core::slice::from_raw_parts_mut(y_buf.as_mut_ptr() as *mut i32, n) };
 
         exp_rotation(x, n, 1, stride, k, spread);
         pvq_search(x, y, k, n);
@@ -2311,7 +2314,7 @@ pub fn alg_quant(
         mask
     } else {
         let mut y_mu = [MaybeUninit::<i32>::uninit(); MAX_PVQ_N];
-        let y = unsafe { std::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, MAX_PVQ_N) };
+        let y = unsafe { core::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, MAX_PVQ_N) };
 
         exp_rotation(x, n, 1, stride, k, spread);
         pvq_search(x, &mut y[..n], k, n);
@@ -2425,7 +2428,7 @@ pub fn alg_quant_qext(
         mask
     } else {
         let mut y_mu = [MaybeUninit::<i32>::uninit(); MAX_PVQ_N];
-        let y = unsafe { std::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, MAX_PVQ_N) };
+        let y = unsafe { core::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, MAX_PVQ_N) };
 
         exp_rotation(x, n, 1, stride, k, spread);
         pvq_search(x, &mut y[..n], k, n);
@@ -2460,7 +2463,7 @@ pub fn alg_unquant(
     gain: f32,
 ) -> u32 {
     let mut y_mu = [MaybeUninit::<i32>::uninit(); MAX_PVQ_N];
-    let y = unsafe { std::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, MAX_PVQ_N) };
+    let y = unsafe { core::slice::from_raw_parts_mut(y_mu.as_mut_ptr() as *mut i32, MAX_PVQ_N) };
     decode_pulses(&mut y[..n], n as u32, k as u32, rc);
 
     let mask = extract_collapse_mask(&y[..n], n, stride);

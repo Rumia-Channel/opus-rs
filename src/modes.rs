@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+use crate::compat::OnceCell;
 
 use crate::mdct::MdctLookup;
 
@@ -130,10 +130,10 @@ pub const E_MEANS: [f32; 25] = [
 ];
 
 pub fn default_mode() -> &'static CeltMode {
-    &MODE_48000_960_120
+    MODE_48000_960_120.get(CeltMode::new_48000_960_120)
 }
 
-static MODE_48000_960_120: LazyLock<CeltMode> = LazyLock::new(CeltMode::new_48000_960_120);
+static MODE_48000_960_120: OnceCell<CeltMode> = OnceCell::new();
 
 const LOG_N_400: [i16; 21] = [
     0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 16, 16, 16, 21, 21, 24, 29, 34, 36,

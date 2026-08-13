@@ -1,6 +1,13 @@
-use std::f32::consts::PI;
+use core::f32::consts::PI;
+
+#[cfg(not(feature = "std"))]
+use crate::compat::Math;
+use crate::fixedvec::FixedVec;
 
 pub const MAXFACTORS: usize = 8;
+
+/// Maximum FFT size (`nfft`) used by the MDCT plans. Bounded by `MAX_N4 = 480`.
+pub const KISS_MAX_N: usize = 480;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
@@ -45,8 +52,8 @@ pub struct KissFftState {
     scale: f32,
     shift: i32,
     factors: [i16; 2 * MAXFACTORS],
-    pub bitrev: Vec<i16>,
-    twiddles: Vec<KissCpx>,
+    pub bitrev: FixedVec<i16, KISS_MAX_N>,
+    twiddles: FixedVec<KissCpx, KISS_MAX_N>,
 }
 
 fn kf_factor(n_orig: usize, factors: &mut [i16; 2 * MAXFACTORS]) -> bool {
@@ -129,14 +136,14 @@ fn compute_bitrev_table(
     }
 }
 
-fn compute_twiddles(nfft: usize) -> Vec<KissCpx> {
+fn compute_twiddles(nfft: usize) -> FixedVec<KissCpx, KISS_MAX_N> {
     let two_pi_over_n = -2.0 * PI / nfft as f32;
-    (0..nfft)
-        .map(|i| {
-            let phase = two_pi_over_n * i as f32;
-            KissCpx::new(phase.cos(), phase.sin())
-        })
-        .collect()
+    let mut out: FixedVec<KissCpx, KISS_MAX_N> = FixedVec::new();
+    for i in 0..nfft {
+        let phase = two_pi_over_n * i as f32;
+        out.push(KissCpx::new(phase.cos(), phase.sin()));
+    }
+    out
 }
 
 impl KissFftState {
@@ -149,7 +156,7 @@ impl KissFftState {
         let scale = 1.0 / nfft as f32;
         let twiddles = compute_twiddles(nfft);
 
-        let mut bitrev = vec![0i16; nfft];
+        let mut bitrev = FixedVec::from_value(0i16, nfft);
         compute_bitrev_table(0, &mut bitrev, 1, 1, &factors);
 
         Some(Self {
@@ -176,7 +183,7 @@ impl KissFftState {
             return None;
         }
 
-        let mut bitrev = vec![0i16; nfft];
+        let mut bitrev = FixedVec::from_value(0i16, nfft);
         compute_bitrev_table(0, &mut bitrev, 1, 1, &factors);
 
         Some(Self {
@@ -203,7 +210,7 @@ impl KissFftState {
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn kf_bfly2_m1_neon(fout: &mut [KissCpx], n: usize) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let ptr = fout.as_mut_ptr() as *mut f32;
 
@@ -272,7 +279,7 @@ fn kf_bfly2(fout: &mut [KissCpx], m: usize, n: usize) {
     if m == 1 {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         unsafe {
-            if std::arch::is_x86_feature_detected!("avx") {
+            if crate::compat::x86_has_avx() {
                 kf_bfly2_m1_avx(fout, n);
                 return;
             }
@@ -289,7 +296,7 @@ fn kf_bfly2(fout: &mut [KissCpx], m: usize, n: usize) {
             fout[idx] = c_add(&fout[idx], &t);
         }
     } else {
-        let tw: f32 = std::f32::consts::FRAC_1_SQRT_2;
+        let tw: f32 = core::f32::consts::FRAC_1_SQRT_2;
         for i in 0..n {
             let base = i * 8;
 
@@ -321,7 +328,7 @@ fn kf_bfly2(fout: &mut [KissCpx], m: usize, n: usize) {
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn kf_bfly4_m1_neon(fout: &mut [KissCpx], n: usize) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let ptr = fout.as_mut_ptr() as *mut f32;
 
@@ -474,7 +481,7 @@ fn kf_bfly4(
     if m == 1 {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         unsafe {
-            if std::arch::is_x86_feature_detected!("avx") {
+            if crate::compat::x86_has_avx() {
                 kf_bfly4_m1_avx(fout, n);
                 return;
             }
@@ -500,7 +507,7 @@ fn kf_bfly4(
     } else {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         unsafe {
-            if std::arch::is_x86_feature_detected!("avx") {
+            if crate::compat::x86_has_avx() {
                 kf_bfly4_avx_inner(fout, twiddles, m, n, mm, fstride);
                 return;
             }
@@ -560,7 +567,7 @@ fn kf_bfly3(
 ) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
-        if std::arch::is_x86_feature_detected!("avx") {
+        if crate::compat::x86_has_avx() {
             kf_bfly3_avx_inner(fout, fstride, twiddles, m, n, mm);
             return;
         }
@@ -623,7 +630,7 @@ fn kf_bfly5(
 ) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
-        if std::arch::is_x86_feature_detected!("avx") {
+        if crate::compat::x86_has_avx() {
             kf_bfly5_avx_inner(fout, fstride, twiddles, m, n, mm);
             return;
         }
@@ -912,10 +919,10 @@ unsafe fn kf_bfly5_avx_inner(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn neon_cmul_2(
-    a: std::arch::aarch64::float32x4_t,
-    b: std::arch::aarch64::float32x4_t,
-) -> std::arch::aarch64::float32x4_t {
-    use std::arch::aarch64::*;
+    a: core::arch::aarch64::float32x4_t,
+    b: core::arch::aarch64::float32x4_t,
+) -> core::arch::aarch64::float32x4_t {
+    use core::arch::aarch64::*;
 
     let dup_r = vcombine_f32(
         vdup_lane_f32(vget_low_f32(a), 0),
@@ -945,7 +952,7 @@ unsafe fn kf_bfly3_neon_inner(
     n: usize,
     mm: usize,
 ) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let m2 = 2 * m;
     let epi3_i: f32 = -0.866_025_4;
@@ -1039,7 +1046,7 @@ unsafe fn kf_bfly5_neon_inner(
     n: usize,
     mm: usize,
 ) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let m2 = 2 * m;
     let m3 = 3 * m;
@@ -1098,11 +1105,11 @@ unsafe fn kf_bfly5_neon_inner(
             let s3 = neon_cmul_2(fm3_v, tw3_v);
             let s4 = neon_cmul_2(fm4_v, tw4_v);
 
-            let s1_arr: [f32; 4] = std::mem::transmute(s1);
-            let s2_arr: [f32; 4] = std::mem::transmute(s2);
-            let s3_arr: [f32; 4] = std::mem::transmute(s3);
-            let s4_arr: [f32; 4] = std::mem::transmute(s4);
-            let f0_arr: [f32; 4] = std::mem::transmute(f0);
+            let s1_arr: [f32; 4] = core::mem::transmute(s1);
+            let s2_arr: [f32; 4] = core::mem::transmute(s2);
+            let s3_arr: [f32; 4] = core::mem::transmute(s3);
+            let s4_arr: [f32; 4] = core::mem::transmute(s4);
+            let f0_arr: [f32; 4] = core::mem::transmute(f0);
 
             for k in 0..2 {
                 let s1r = s1_arr[2 * k];
@@ -1272,7 +1279,7 @@ pub fn opus_ifft(st: &KissFftState, fin: &[KissCpx], fout: &mut [KissCpx]) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 
@@ -1302,7 +1309,7 @@ mod tests {
     fn test_bitrev_permutation() {
         for &nfft in &[60, 120, 240, 480] {
             let st = KissFftState::new(nfft).unwrap();
-            let mut sorted: Vec<i16> = st.bitrev.clone();
+            let mut sorted: Vec<i16> = st.bitrev.as_slice().to_vec();
             sorted.sort();
             let expected: Vec<i16> = (0..nfft).map(|x| x as i16).collect();
             assert_eq!(

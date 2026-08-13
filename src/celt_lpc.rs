@@ -1,3 +1,4 @@
+use crate::fixedvec::FixedVec;
 use crate::pitch::pitch_xcorr;
 
 pub fn lpc(lpc: &mut [f32], ac: &[f32], p: usize) {
@@ -41,13 +42,13 @@ pub fn autocorr(
     lag: usize,
     n: usize,
 ) {
-    let xx_vec;
+    let xx_vec: FixedVec<f32, 2880>;
     let xx: &[f32] = if let Some(win) = window {
         if x.len() < n {
             return;
         }
         xx_vec = {
-            let mut v = x[0..n].to_vec();
+            let mut v: FixedVec<f32, 2880> = FixedVec::from_slice(&x[0..n]);
             for i in 0..overlap {
                 v[i] *= win[i];
                 v[n - 1 - i] *= win[i];
@@ -116,7 +117,7 @@ pub fn celt_iir(x: &[f32], den: &[f32], y: &mut [f32], n: usize, ord: usize, mem
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn celt_fir_neon(x: &[f32], num: &[f32], y: &mut [f32], n: usize, ord: usize) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     if ord < 4 {
         for i in 0..n {
@@ -171,7 +172,7 @@ unsafe fn celt_iir_neon(
     ord: usize,
     mem: &mut [f32],
 ) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     if ord < 4 {
         for i in 0..n {
