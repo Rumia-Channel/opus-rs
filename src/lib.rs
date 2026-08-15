@@ -701,6 +701,10 @@ impl OpusEncoder {
 
         self.rc.done();
 
+        if self.rc.error != 0 {
+            return Err("Range coder buffer overflow: encoded data exceeds packet budget");
+        }
+
         if mode == OpusMode::SilkOnly {
             let mut ret = silk_ret_bytes.min(self.rc.storage as usize);
             while ret > 2 && self.rc.buf[ret - 1] == 0 {

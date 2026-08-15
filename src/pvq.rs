@@ -102,6 +102,26 @@ const CELT_PVQ_U_ROW: [u32; 15] = [
     0, 176, 351, 525, 698, 870, 1041, 1131, 1178, 1207, 1226, 1240, 1248, 1254, 1257,
 ];
 
+/// Largest column (max(n, k)) covered by each row of `CELT_PVQ_U_DATA`. Row `r`
+/// holds `U(min, max)` for `max` in `[r, CMAX[r]]`; a lookup with a larger
+/// `max` would alias the next row's block, so it must be computed instead.
+const CELT_PVQ_U_CMAX: [usize; 15] = [
+    176, 176, 176, 176, 176, 176, 96, 54, 37, 28, 24, 19, 18, 16, 14,
+];
+
+/// Maximum number of pulses per band (`CELT_MAX_PULSES` in libopus).
+pub const MAX_PVQ_K: usize = 128;
+const MAX_PVQ_U: usize = MAX_PVQ_K + 2;
+pub const MAX_PVQ_N: usize = 352;
+
+/// `saturating_add(a, b, c)`, clamped to `u32::MAX` so an out-of-domain
+/// `(n, k)` can never silently wrap to a plausible-but-wrong codebook size.
+#[inline(always)]
+fn saturating_add3(a: u32, b: u32, c: u32) -> u32 {
+    let s = a as u64 + b as u64 + c as u64;
+    s.min(u32::MAX as u64) as u32
+}
+
 #[inline(always)]
 pub fn celt_pvq_u_lookup(n: u32, k: u32) -> u32 {
     let r = n.min(k) as usize;
@@ -110,19 +130,16 @@ pub fn celt_pvq_u_lookup(n: u32, k: u32) -> u32 {
     if r >= CELT_PVQ_U_ROW.len() {
         return compute_u(n, k);
     }
+    if c > CELT_PVQ_U_CMAX[r] {
+        return compute_u(n, k);
+    }
     unsafe {
         let row_base = *CELT_PVQ_U_ROW.get_unchecked(r);
         let idx = row_base as usize + c;
-        if idx >= CELT_PVQ_U_DATA.len() {
-            return compute_u(n, k);
-        }
+        debug_assert!(idx < CELT_PVQ_U_DATA.len());
         *CELT_PVQ_U_DATA.get_unchecked(idx)
     }
 }
-
-const MAX_PVQ_K: usize = 128;
-const MAX_PVQ_U: usize = MAX_PVQ_K + 2;
-pub const MAX_PVQ_N: usize = 352;
 
 pub fn ncwrs(n: u32, k: u32) -> u32 {
     if n == 0 {
@@ -131,18 +148,21 @@ pub fn ncwrs(n: u32, k: u32) -> u32 {
     if n == 1 {
         return if k > 0 { 2 } else { 1 };
     }
+    if k > MAX_PVQ_K as u32 {
+        return u32::MAX;
+    }
     let mut u = [0u32; MAX_PVQ_U];
     u[0] = 0;
     u[1] = 1;
     for ki in 2..=(k + 1) as usize {
-        u[ki] = (ki as u32 * 2).wrapping_sub(1);
+        u[ki] = ((ki as u32 * 2) as u64).saturating_sub(1) as u32;
     }
     let mut curr_n = n;
     while curr_n > 2 {
         unext(&mut u[1..], (k + 1) as usize, 1);
         curr_n -= 1;
     }
-    u[k as usize].wrapping_add(u[k as usize + 1])
+    u[k as usize].saturating_add(u[k as usize + 1])
 }
 
 fn compute_u(n: u32, k: u32) -> u32 {
@@ -152,11 +172,14 @@ fn compute_u(n: u32, k: u32) -> u32 {
     if n == 1 {
         return 1;
     }
+    if k > MAX_PVQ_K as u32 {
+        return u32::MAX;
+    }
     let mut u = [0u32; MAX_PVQ_U];
     u[0] = 0;
     u[1] = 1;
     for ki in 2..=(k + 1) as usize {
-        u[ki] = (ki as u32 * 2).wrapping_sub(1);
+        u[ki] = ((ki as u32 * 2) as u64).saturating_sub(1) as u32;
     }
     let mut curr_n = n;
     while curr_n > 2 {
@@ -173,13 +196,13 @@ pub fn celt_pvq_u(n: u32, k: u32) -> u32 {
 
 #[inline(always)]
 pub fn celt_pvq_v(n: u32, k: u32) -> u32 {
-    celt_pvq_u_lookup(n, k).wrapping_add(celt_pvq_u_lookup(n, k + 1))
+    celt_pvq_u_lookup(n, k).saturating_add(celt_pvq_u_lookup(n, k + 1))
 }
 
 fn unext(u: &mut [u32], len: usize, mut u0: u32) {
     let mut j = 1;
     while j < len {
-        let u1 = u[j].wrapping_add(u[j - 1]).wrapping_add(u0);
+        let u1 = saturating_add3(u[j], u[j - 1], u0);
         u[j - 1] = u0;
         u0 = u1;
         j += 1;
