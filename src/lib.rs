@@ -83,8 +83,14 @@ enum OpusMode {
 }
 
 pub struct OpusEncoder {
+    #[cfg(not(feature = "heap"))]
     celt_enc: CeltEncoder,
+    #[cfg(feature = "heap")]
+    celt_enc: Box<CeltEncoder>,
+    #[cfg(not(feature = "heap"))]
     silk_enc: SilkEncoderState,
+    #[cfg(feature = "heap")]
+    silk_enc: Box<SilkEncoderState>,
     application: Application,
     sampling_rate: i32,
     channels: usize,
@@ -103,11 +109,26 @@ pub struct OpusEncoder {
     variable_hp_smth2_q15: i32,
     hp_mem: FixedVec<i32, OPUS_HP_MEM>,
 
+    #[cfg(not(feature = "heap"))]
     buf_filtered: FixedVec<i16, OPUS_MAX_FRAME>,
+    #[cfg(feature = "heap")]
+    buf_filtered: Box<FixedVec<i16, OPUS_MAX_FRAME>>,
+    #[cfg(not(feature = "heap"))]
     buf_silk_input: FixedVec<i16, OPUS_MAX_FRAME>,
+    #[cfg(feature = "heap")]
+    buf_silk_input: Box<FixedVec<i16, OPUS_MAX_FRAME>>,
+    #[cfg(not(feature = "heap"))]
     buf_stereo_mid: FixedVec<i16, OPUS_MAX_FRAME>,
+    #[cfg(feature = "heap")]
+    buf_stereo_mid: Box<FixedVec<i16, OPUS_MAX_FRAME>>,
+    #[cfg(not(feature = "heap"))]
     buf_stereo_side: FixedVec<i16, OPUS_MAX_FRAME>,
+    #[cfg(feature = "heap")]
+    buf_stereo_side: Box<FixedVec<i16, OPUS_MAX_FRAME>>,
+    #[cfg(not(feature = "heap"))]
     buf_celt_input: FixedVec<f32, OPUS_MAX_FRAME>,
+    #[cfg(feature = "heap")]
+    buf_celt_input: Box<FixedVec<f32, OPUS_MAX_FRAME>>,
     down2_state_first: [i32; 2],
     down2_state_second: [i32; 2],
     down2_3_state: [i32; 6],
@@ -234,6 +255,36 @@ mod silk_rate_tests {
     }
 }
 
+/// Uniformly borrow a codec-state field that is a `Box<T>` under the `heap`
+/// feature and a plain `T` otherwise, so call sites don't need `#[cfg]` on
+/// every `&self.field` / `&mut self.field`.
+///
+/// Under `heap` the field is a `Box<...>`, so `T: Deref(DerefMut)` resolves to
+/// the box itself and the `Target` is the inner type; without `heap` the field
+/// is the inner type directly (`?Sized` lets `&mut [i16]`-style coercion choose
+/// the slice target).
+#[cfg(feature = "heap")]
+#[inline(always)]
+fn state_ref<T: core::ops::Deref>(b: &T) -> &T::Target {
+    b
+}
+#[cfg(not(feature = "heap"))]
+#[inline(always)]
+fn state_ref<T: ?Sized>(b: &T) -> &T {
+    b
+}
+
+#[cfg(feature = "heap")]
+#[inline(always)]
+fn state_mut<T: core::ops::DerefMut>(b: &mut T) -> &mut T::Target {
+    b
+}
+#[cfg(not(feature = "heap"))]
+#[inline(always)]
+fn state_mut<T: ?Sized>(b: &mut T) -> &mut T {
+    b
+}
+
 impl OpusEncoder {
     pub fn new(
         sampling_rate: i32,
@@ -248,10 +299,16 @@ impl OpusEncoder {
         }
 
         let mode = modes::default_mode();
+        #[cfg(feature = "heap")]
+        let celt_enc = Box::new(CeltEncoder::new(mode, channels));
+        #[cfg(not(feature = "heap"))]
         let celt_enc = CeltEncoder::new(mode, channels);
 
+        #[cfg(feature = "heap")]
+        let mut silk_enc = Box::new(SilkEncoderState::default());
+        #[cfg(not(feature = "heap"))]
         let mut silk_enc = SilkEncoderState::default();
-        if silk_init_encoder(&mut silk_enc, 0) != 0 {
+        if silk_init_encoder(state_mut(&mut silk_enc), 0) != 0 {
             return Err("SILK encoder initialization failed");
         }
 
@@ -322,11 +379,26 @@ impl OpusEncoder {
             variable_hp_smth2_q15,
             hp_mem: FixedVec::from_value(0, channels * 2),
 
+            #[cfg(not(feature = "heap"))]
             buf_filtered: FixedVec::new(),
+            #[cfg(feature = "heap")]
+            buf_filtered: Box::new(FixedVec::new()),
+            #[cfg(not(feature = "heap"))]
             buf_silk_input: FixedVec::new(),
+            #[cfg(feature = "heap")]
+            buf_silk_input: Box::new(FixedVec::new()),
+            #[cfg(not(feature = "heap"))]
             buf_stereo_mid: FixedVec::new(),
+            #[cfg(feature = "heap")]
+            buf_stereo_mid: Box::new(FixedVec::new()),
+            #[cfg(not(feature = "heap"))]
             buf_stereo_side: FixedVec::new(),
+            #[cfg(feature = "heap")]
+            buf_stereo_side: Box::new(FixedVec::new()),
+            #[cfg(not(feature = "heap"))]
             buf_celt_input: FixedVec::new(),
+            #[cfg(feature = "heap")]
+            buf_celt_input: Box::new(FixedVec::new()),
             down2_state_first: [0; 2],
             down2_state_second: [0; 2],
             down2_3_state: [0; 6],
@@ -463,7 +535,7 @@ impl OpusEncoder {
                 let silk_init_bitrate = (((n_bytes - 1) * 8) as i64 * self.sampling_rate as i64
                     / frame_size as i64) as i32;
                 silk_control_encoder(
-                    &mut self.silk_enc,
+                    state_mut(&mut self.silk_enc),
                     silk_fs_khz,
                     frame_ms,
                     silk_init_bitrate,
@@ -509,7 +581,7 @@ impl OpusEncoder {
                 hp_cutoff(
                     input,
                     cutoff_hz,
-                    &mut self.buf_filtered,
+                    state_mut(&mut self.buf_filtered),
                     &mut self.hp_mem,
                     frame_size,
                     self.channels,
@@ -521,7 +593,7 @@ impl OpusEncoder {
                 }
             }
 
-            let input_i16 = &self.buf_filtered;
+            let input_i16 = state_ref(&self.buf_filtered);
 
             let silk_input: &[i16] = if mode == OpusMode::SilkOnly && self.sampling_rate > 16000 {
                 if self.sampling_rate == 48000 {
@@ -537,21 +609,21 @@ impl OpusEncoder {
                     self.buf_silk_input.resize(silk_frame_size, 0);
                     silk_resampler_down2_3(
                         &mut self.down2_3_state,
-                        &mut self.buf_silk_input,
+                        state_mut(&mut self.buf_silk_input),
                         &stage1_buf[..stage1_size],
                         stage1_size as i32,
                     );
-                    &self.buf_silk_input
+                    state_ref(&self.buf_silk_input)
                 } else if self.sampling_rate == 24000 {
                     let silk_frame_size = frame_size * 2 / 3;
                     self.buf_silk_input.resize(silk_frame_size, 0);
                     silk_resampler_down2_3(
                         &mut self.down2_3_state,
-                        &mut self.buf_silk_input,
+                        state_mut(&mut self.buf_silk_input),
                         input_i16,
                         frame_size as i32,
                     );
-                    &self.buf_silk_input
+                    state_ref(&self.buf_silk_input)
                 } else {
                     input_i16
                 }
@@ -571,14 +643,14 @@ impl OpusEncoder {
                     .stereo
                     .side
                     .copy_from_slice(&self.buf_stereo_side[..frame_length]);
-                &self.buf_stereo_mid
+                state_ref(&self.buf_stereo_mid)
             } else if mode == OpusMode::Hybrid && self.sampling_rate > 16000 {
                 if self.sampling_rate == 48000 {
                     let silk_frame_size = frame_size / 3;
                     self.buf_silk_input.resize(silk_frame_size, 0);
                     silk::resampler::silk_resampler_down_1_3(
                         &mut self.down_1_3_state,
-                        &mut self.buf_silk_input,
+                        state_mut(&mut self.buf_silk_input),
                         input_i16,
                     );
                 } else {
@@ -586,12 +658,12 @@ impl OpusEncoder {
                     self.buf_silk_input.resize(silk_frame_size, 0);
                     silk_resampler_down2_3(
                         &mut self.down2_3_state,
-                        &mut self.buf_silk_input,
+                        state_mut(&mut self.buf_silk_input),
                         input_i16,
                         frame_size as i32,
                     );
                 }
-                &self.buf_silk_input
+                state_ref(&self.buf_silk_input)
             } else {
                 input_i16
             };
@@ -640,7 +712,7 @@ impl OpusEncoder {
                 0
             };
             let ret = silk_encode(
-                &mut self.silk_enc,
+                state_mut(&mut self.silk_enc),
                 silk_input,
                 silk_input.len(),
                 &mut self.rc,
@@ -685,7 +757,7 @@ impl OpusEncoder {
                         self.buf_celt_input[ch * frame_size + i] = input[i * self.channels + ch];
                     }
                 }
-                &self.buf_celt_input
+                state_ref(&self.buf_celt_input)
             };
 
             if self.rc.tell() <= total_packet_bits {
@@ -769,8 +841,14 @@ impl OpusEncoder {
 }
 
 pub struct OpusDecoder {
+    #[cfg(not(feature = "heap"))]
     celt_dec: CeltDecoder,
+    #[cfg(feature = "heap")]
+    celt_dec: Box<CeltDecoder>,
+    #[cfg(not(feature = "heap"))]
     silk_dec: silk::dec_api::SilkDecoder,
+    #[cfg(feature = "heap")]
+    silk_dec: Box<silk::dec_api::SilkDecoder>,
     sampling_rate: i32,
     channels: usize,
 
@@ -793,15 +871,33 @@ pub struct OpusDecoder {
 
     pub hybrid_skip_celt: bool,
 
+    #[cfg(not(feature = "heap"))]
     w_pcm_i16: FixedVec<i16, OPUS_PCM_I16>,
+    #[cfg(feature = "heap")]
+    w_pcm_i16: Box<FixedVec<i16, OPUS_PCM_I16>>,
+    #[cfg(not(feature = "heap"))]
     w_silk_out: FixedVec<f32, OPUS_SUBFRAME_SCRATCH>,
+    #[cfg(feature = "heap")]
+    w_silk_out: Box<FixedVec<f32, OPUS_SUBFRAME_SCRATCH>>,
+    #[cfg(not(feature = "heap"))]
     w_pcm_resampled: FixedVec<i16, OPUS_SUBFRAME_SCRATCH>,
+    #[cfg(feature = "heap")]
+    w_pcm_resampled: Box<FixedVec<i16, OPUS_SUBFRAME_SCRATCH>>,
+    #[cfg(not(feature = "heap"))]
     w_celt_planar: FixedVec<f32, OPUS_SUBFRAME_SCRATCH>,
+    #[cfg(feature = "heap")]
+    w_celt_planar: Box<FixedVec<f32, OPUS_SUBFRAME_SCRATCH>>,
+    #[cfg(not(feature = "heap"))]
     w_celt_out: FixedVec<f32, OPUS_SUBFRAME_SCRATCH>,
+    #[cfg(feature = "heap")]
+    w_celt_out: Box<FixedVec<f32, OPUS_SUBFRAME_SCRATCH>>,
 
     /// Tail of the previous frame's output, used for smooth_fade at mode
     /// transitions (libopus pcm_transition + smooth_fade).
+    #[cfg(not(feature = "heap"))]
     prev_pcm_tail: FixedVec<f32, OPUS_PCM_TAIL>,
+    #[cfg(feature = "heap")]
+    prev_pcm_tail: Box<FixedVec<f32, OPUS_PCM_TAIL>>,
 }
 
 impl OpusDecoder {
@@ -814,8 +910,14 @@ impl OpusDecoder {
         }
 
         let mode = modes::default_mode();
+        #[cfg(feature = "heap")]
+        let celt_dec = Box::new(CeltDecoder::new(mode, channels, sampling_rate));
+        #[cfg(not(feature = "heap"))]
         let celt_dec = CeltDecoder::new(mode, channels, sampling_rate);
 
+        #[cfg(feature = "heap")]
+        let mut silk_dec = Box::new(silk::dec_api::SilkDecoder::new());
+        #[cfg(not(feature = "heap"))]
         let mut silk_dec = silk::dec_api::SilkDecoder::new();
         silk_dec.init(sampling_rate.min(16000), channels as i32);
         silk_dec.channel_state[0].fs_api_hz = sampling_rate;
@@ -835,14 +937,32 @@ impl OpusDecoder {
             prev_internal_rate: 0,
             hybrid_skip_celt: false,
 
+            #[cfg(not(feature = "heap"))]
             w_pcm_i16: FixedVec::from_value(0i16, 960 * channels),
+            #[cfg(feature = "heap")]
+            w_pcm_i16: Box::new(FixedVec::from_value(0i16, 960 * channels)),
 
+            #[cfg(not(feature = "heap"))]
             w_silk_out: FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels),
+            #[cfg(feature = "heap")]
+            w_silk_out: Box::new(FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels)),
+            #[cfg(not(feature = "heap"))]
             w_pcm_resampled: FixedVec::from_value(0i16, OPUS_MAX_SUBFRAME * channels),
+            #[cfg(feature = "heap")]
+            w_pcm_resampled: Box::new(FixedVec::from_value(0i16, OPUS_MAX_SUBFRAME * channels)),
+            #[cfg(not(feature = "heap"))]
             w_celt_planar: FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels),
+            #[cfg(feature = "heap")]
+            w_celt_planar: Box::new(FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels)),
+            #[cfg(not(feature = "heap"))]
             w_celt_out: FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels),
+            #[cfg(feature = "heap")]
+            w_celt_out: Box::new(FixedVec::from_value(0.0f32, OPUS_MAX_SUBFRAME * channels)),
 
+            #[cfg(not(feature = "heap"))]
             prev_pcm_tail: FixedVec::from_value(0.0f32, 240 * channels),
+            #[cfg(feature = "heap")]
+            prev_pcm_tail: Box::new(FixedVec::from_value(0.0f32, 240 * channels)),
         })
     }
 
@@ -1133,7 +1253,8 @@ impl OpusDecoder {
                     debug_assert!(pcm_i16_len <= self.w_pcm_i16.len());
 
                     let ret = {
-                        let (silk_dec, pcm_i16) = (&mut self.silk_dec, &mut self.w_pcm_i16);
+                        let (silk_dec, pcm_i16) =
+                            (state_mut(&mut self.silk_dec), state_mut(&mut self.w_pcm_i16));
                         let lost_flag = if lost_frame {
                             silk::decode_frame::FLAG_PACKET_LOST
                         } else {
@@ -1178,8 +1299,8 @@ impl OpusDecoder {
                         {
                             let (res, inp, out) = (
                                 &mut self.silk_resampler,
-                                &self.w_pcm_i16,
-                                &mut self.w_pcm_resampled,
+                                state_ref(&self.w_pcm_i16),
+                                state_mut(&mut self.w_pcm_resampled),
                             );
                             res.process(
                                 &mut out[..out_len],
@@ -1191,8 +1312,8 @@ impl OpusDecoder {
                         if self.channels == 2 {
                             let (res, inp, out) = (
                                 &mut self.silk_resampler_2,
-                                &self.w_pcm_i16,
-                                &mut self.w_pcm_resampled,
+                                state_ref(&self.w_pcm_i16),
+                                state_mut(&mut self.w_pcm_resampled),
                             );
                             res.process(
                                 &mut out[out_len..2 * out_len],
@@ -1284,7 +1405,8 @@ impl OpusDecoder {
                     debug_assert!(pcm_silk_i16_len <= self.w_pcm_i16.len());
 
                     let ret = {
-                        let (silk_dec, pcm_i16) = (&mut self.silk_dec, &mut self.w_pcm_i16);
+                        let (silk_dec, pcm_i16) =
+                            (state_mut(&mut self.silk_dec), state_mut(&mut self.w_pcm_i16));
                         let lost_flag = if lost_frame {
                             silk::decode_frame::FLAG_PACKET_LOST
                         } else {
@@ -1330,8 +1452,8 @@ impl OpusDecoder {
                             {
                                 let (res, inp, out) = (
                                     &mut self.silk_resampler,
-                                    &self.w_pcm_i16,
-                                    &mut self.w_pcm_resampled,
+                                    state_ref(&self.w_pcm_i16),
+                                    state_mut(&mut self.w_pcm_resampled),
                                 );
                                 res.process(
                                     &mut out[..out_len],
@@ -1343,8 +1465,8 @@ impl OpusDecoder {
                             if self.channels == 2 {
                                 let (res, inp, out) = (
                                     &mut self.silk_resampler_2,
-                                    &self.w_pcm_i16,
-                                    &mut self.w_pcm_resampled,
+                                    state_ref(&self.w_pcm_i16),
+                                    state_mut(&mut self.w_pcm_resampled),
                                 );
                                 res.process(
                                     &mut out[out_len..2 * out_len],
@@ -1383,7 +1505,8 @@ impl OpusDecoder {
                     if skip_celt {
                         self.w_celt_out[..silk_out_len].fill(0.0);
                     } else {
-                        let (celt_dec, celt_planar) = (&mut self.celt_dec, &mut self.w_celt_planar);
+                        let (celt_dec, celt_planar) =
+                            (state_mut(&mut self.celt_dec), state_mut(&mut self.w_celt_planar));
                         celt_dec.decode_from_range_coder_with_band_range(
                             &mut rc,
                             total_bits,

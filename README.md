@@ -39,9 +39,16 @@ cargo run --example wav_test
 
 ## `#![no_std]` + no-`alloc` Support
 
-opus-rs is **fully heap-free**: it builds as `#![no_std]` with **no `alloc` crate** and therefore needs **no global allocator**. All working buffers are inline, fixed-size arrays (sized to the Opus worst case); growable state uses an internal `FixedVec<T, N>` (a tiny `Vec`-like type over `[MaybeUninit<T>; N]`).
+By default opus-rs runs on `std` with the **`heap` feature**: the large codec state
+(`OpusEncoder`/`OpusDecoder` working buffers) is allocated with `Box`, so the public
+structs are tiny (~1 KB each) and constructing them uses almost no stack.
 
-Disable the default `std` feature and enable `libm` (a pure-Rust math backend for `sin`/`cos`/`sqrt`/…, which `core` does not provide):
+For `#![no_std]`, disable the default features. The crate then builds as
+`#![no_std]` with **no `alloc`** — fully heap-free, no global allocator required —
+and every working buffer is an inline, fixed-size array (sized to the Opus worst
+case); growable state uses an internal `FixedVec<T, N>` (a tiny `Vec`-like type over
+`[MaybeUninit<T>; N]`). In that configuration the structs are large, so place them
+in a `static` (wrap init in your own `Once`-like guard) or a dedicated buffer.
 
 ```toml
 [dependencies.opus-rs]
@@ -50,20 +57,24 @@ default-features = false
 features = ["libm"]
 ```
 
-The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into caller-provided buffers) is identical to the `std` build.
+The public API (`OpusEncoder`/`OpusDecoder` with `encode`/`decode` writing into caller-provided buffers) is identical in both configurations.
 
 ### Feature flags
 
 | Feature  | Default | Description |
 |----------|---------|-------------|
 | `std`    | yes     | Enables OS-backed runtime x86 SIMD detection (CPUID). Without it the crate is `#![no_std]`. |
+| `heap`   | yes     | Allocates the large codec state on the heap (`Box`), shrinking `OpusEncoder`/`OpusDecoder` to ~1 KB so they can live on ordinary stacks. Requires `std`. |
 | `libm`   | no      | Required for `#![no_std]` builds — provides float math via a pure-Rust port of musl `libm`. Not needed when `std` is on. |
 
 > Runtime dependency footprint: `std` build → **0 deps**; `no_std` build → **1 dep** (`libm`, pure Rust).
 
 ### Notes for `no_std` users
 
-- **Large structs:** because every working buffer is inline, `OpusEncoder`/`OpusDecoder` are large (~250 KB / ~175 KB each). On a constrained target, place them in a `static` (wrap init in your own `Once`-like guard) or a dedicated buffer rather than on the stack. Test threads use a 16 MB stack (see `.cargo/config.toml`).
+- **Large structs:** without `heap`, every working buffer is inline, so
+  `OpusEncoder`/`OpusDecoder` are large (~250 KB / ~175 KB each). Place them in a
+  `static` (wrap init in your own `Once`-like guard) or a dedicated buffer rather
+  than on the stack. Test threads use a 16 MB stack (see `.cargo/config.toml`).
 - **x86 SIMD:** without `std`, AVX/AVX2 dispatch falls back to compile-time detection. Build with `RUSTFLAGS="-C target-feature=+avx2"` to enable it. aarch64 NEON is unconditional.
 - **Packets are capped** at the RFC 6716 maximum of 1276 bytes (the heap-free range-coder buffer is sized accordingly); standalone `RangeCoder`/CELT use supports up to 2048 bytes.
 - **Verified targets:** `thumbv7em-none-eabi` (Cortex-M), `wasm32-unknown-unknown`, and any Linux no_std target. Check with `scripts/check_no_std.sh`.
@@ -98,6 +109,19 @@ Measured on Apple Silicon M-series (aarch64), compiled with `--release` (opt-lev
 
 
 ## Release Notes
+
+### 0.1.29
+
+- **Default build is now heap-backed (issue #12).** A new `heap` feature (on by
+  default, requires `std`) allocates the large codec state with `Box`, shrinking
+  `OpusEncoder`/`OpusDecoder` from ~250 KB / ~175 KB to ~1 KB each. Constructing,
+  encoding and decoding now fit on a 768 KiB stack (previously `OpusEncoder::new`
+  alone needed ~850 KiB in release / ~2 MiB in debug, overflowing small-stack
+  threads such as Windows' 1 MiB main thread). Disable default features for the
+  heap-free `#![no_std]` build, which keeps the inline layout.
+- **Tests:** add `tests/stack_usage_test.rs` asserting the structs stay <4 KiB
+  with `heap`, >100 KiB without it, and that a full construct + encode + decode
+  round-trip fits in a 768 KiB stack thread.
 
 ### 0.1.28
 

@@ -2,7 +2,7 @@
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 name = "opus-rs"
-version = "0.1.28"
+version = "0.1.29"
 description = "pure Rust implementation of Opus codec"
 license = "BSD-3-Clause"
 repository = "https://github.com/restsend/opus-rs"
@@ -13,12 +13,20 @@ exclude = [
 ]
 
 [features]
-default = ["std"]
-# Without `std`, the crate is `#![no_std]` with **no `alloc`** (fully heap-free —
-# no global allocator required). All working buffers are inline fixed-size arrays.
-# `std` additionally enables OS-backed runtime x86 SIMD detection (CPUID); without
-# it, x86 SIMD falls back to compile-time `target_feature` detection.
+default = ["std", "heap"]
+# `std` enables OS-backed runtime x86 SIMD detection (CPUID); without it, x86
+# SIMD falls back to compile-time `target_feature` detection.
 std = []
+# With `heap` (default), the large codec state (`OpusEncoder`/`OpusDecoder`
+# working buffers) lives on the heap behind `Box`, so the public structs are tiny
+# (~1 KB) and constructing them uses almost no stack. This requires `std`.
+#
+# Without `heap` (i.e. `default-features = false`), the crate is `#![no_std]`
+# with **no `alloc`** (fully heap-free — no global allocator required): every
+# working buffer is an inline fixed-size array, so `OpusEncoder`/`OpusDecoder`
+# are large (~250 KB / ~175 KB) and must be placed in a `static` or on a large
+# stack by the caller.
+heap = ["std"]
 # Required for `#![no_std]` builds: provides `sin`/`cos`/`sqrt`/`exp2`/... via a
 # pure-Rust port of musl libm (`core` does not provide transcendentals). Not
 # needed when `std` is enabled. Enable with:
