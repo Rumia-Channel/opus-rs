@@ -2159,38 +2159,49 @@ impl CeltEncoder {
             );
         }
 
-        let mut tf_estimate = 0.0f32;
-        let mut tf_chan = 0;
-        let mut weak_transient = false;
+ // Tone detection (C 2022): use channel-contiguous in_buf with N+overlap, float path
+ let mut tone_freq = -1.0f32;
+ let mut toneishness = 0.0f32;
+ {
+ let (f, t) = tone_detect(&*in_buf, channels, buf_stride, mode.fs);
+ tone_freq = f;
+ toneishness = t;
+ }
+ let mut tf_estimate = 0.0f32;
+ let mut tf_chan = 0;
+ let mut weak_transient = false;
 
-        let is_transient = if self.complexity >= 1 {
-            transient_analysis(
-                in_buf,
-                buf_stride,
-                channels,
-                &mut tf_estimate,
-                &mut tf_chan,
-                false,
-                &mut weak_transient,
-                0.0,
-                0.0,
-                &mut self.w_transient_tmp,
-                &mut self.w_transient_tmp2,
-            )
-        } else {
-            false
-        };
+ let is_transient = if self.complexity >= 1 {
+ transient_analysis(
+ in_buf,
+ buf_stride,
+ channels,
+ &mut tf_estimate,
+ &mut tf_chan,
+ false,
+ &mut weak_transient,
+ tone_freq,
+ toneishness,
+ &mut self.w_transient_tmp,
+ &mut self.w_transient_tmp2,
+ )
+ } else {
+ false
+ };
+ // Clamp toneishness as in C 2034: toneishness = min(toneishness, 1 - tf_estimate)
+ // For float, tf_estimate is log-domain; clamp to [0,1]
+ toneishness = toneishness.min((1.0 - tf_estimate).clamp(0.0, 1.0));
 
-        // Check for pure tone: if tonality is very high, bypass pitch search
-        let toneishness = if self.analysis.valid {
-            self.analysis.tonality
-        } else {
-            0.0
-        };
-        let _tone_freq = 0.0f32; // Would be set from analysis if available
-
-        let pf_enabled =
-            start_band == 0 && self.complexity >= 5 && toneishness < 0.99 && channels == 1;
+ // Check for pure tone: if tonality is very high, bypass pitch search
+ // Keep original analysis.tonality check for prefilter gating, but dynalloc uses tone_detect result
+ let analysis_toneishness = if self.analysis.valid {
+ self.analysis.tonality
+ } else {
+ 0.0
+ };
+ // analysis_toneishness kept for prefilter gating; tone_freq/toneishness from tone_detect used for dynalloc
+ let pf_enabled =
+ start_band == 0 && self.complexity >= 5 && analysis_toneishness < 0.99 && channels == 1;
         let (pf_on, gain1, pitch_index) = if pf_enabled {
             run_prefilter(
                 in_buf,
@@ -2528,9 +2539,8 @@ impl CeltEncoder {
         } else {
             None
         };
-        // Tone detection for dynalloc (C 2022) — float path
-        // Use pcm deinterleaved buffer (channel-contiguous) as in libopus in=CC*N
-        let (tone_freq, toneishness) = tone_detect(pcm, channels, frame_size, mode.fs);
+ // Tone detection already computed earlier (C 2022) using in_buf with N+overlap and clamped with tf_estimate
+ // Reuse tone_freq/toneishness from above; do not recompute with pcm/N
         // Surround masking dynalloc (C 2112-2140) — full computation requires energy_mask/hybrid logic,
         // currently zeroed as neutral input to dynalloc's MAX step (1182). Wired for future port.
         let surround_dynalloc = [0.0f32; 21];
