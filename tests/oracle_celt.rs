@@ -13,6 +13,15 @@ fn make_sine(sr: i32, ch: usize, frame_size: usize, freq: f32) -> Vec<f32> {
     v
 }
 
+fn hex_to_bytes(s: &str) -> Vec<u8> {
+    let s = s.trim();
+    assert!(s.len() % 2 == 0, "odd hex length");
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
 #[test]
 fn oracle_celt_sine_48k_mono_64k() {
     let sr = 48000;
@@ -37,6 +46,24 @@ fn oracle_celt_sine_48k_mono_64k() {
     assert!(c_n > 0 && c_n <= 1276);
     let diff = (rs_n as i32 - c_n as i32).abs();
     assert!(diff <= 5, "size diff too large rs {} vs c {} diff {}", rs_n, c_n, diff);
+    // Byte-exact for Rust's own 48k CELT output (regression vs fixture from current port).
+    // Old C (libopus 1.3 via audiopus_sys 0.2.2) differs due to tone/prefilter evolution, so we verify
+    // Rust's determinism and known prefix instead of strict C byte equality.
+    let expected_prefix: [u8; 8] = [0xf8, 0xb3, 0x3a, 0x7a, 0x2b, 0xec, 0x8e, 0x1b];
+    assert_eq!(&rs_buf[..8.min(rs_n)], &expected_prefix[..8.min(rs_n)], "byte prefix mismatch for 48k sine 64k");
+    const EXPECTED_SINE_HEX: &str = "f8b33a7a2bec8e1bdeb7af5777649e182697436b1a099692a835dea050592c7aa969369667d6dfd72528a9f66009b3bdc520e502f960bec9b2448c4fc64a7e0d4186d6a5c2f26260da2bc4b796bb70e7dc32be08bb581bb30d0bda179d96c5d3b6bb8a6fb3fbae5b2f4c018c7b95211cf6334bdb785540fa8c6edf26491844025f11d4926d5c7dfbdfa35358a0f3975230d3f8331282cb8f09dbc155c2020dae";
+    let expected = hex_to_bytes(EXPECTED_SINE_HEX);
+    assert_eq!(rs_n, expected.len(), "fixture len mismatch for 48k sine");
+    assert_eq!(&rs_buf[..rs_n], &expected[..], "full byte-exact mismatch for 48k sine 64k");
+    // Determinism: re-encode same input must be byte-identical
+    let mut rs_enc2 = RsEnc::new(sr, ch, RsApp::Audio).unwrap();
+    rs_enc2.bitrate_bps = br;
+    rs_enc2.use_cbr = true;
+    rs_enc2.complexity = 10;
+    let mut rs_buf2 = vec![0u8; 1276];
+    let rs_n2 = rs_enc2.encode(&pcm, fs, &mut rs_buf2).unwrap();
+    assert_eq!(rs_n, rs_n2, "non-deterministic size");
+    assert_eq!(&rs_buf[..rs_n], &rs_buf2[..rs_n2], "non-deterministic bytes");
 }
 
 #[test]
@@ -68,6 +95,21 @@ fn oracle_impulse_48k_mono_64k() {
     assert!(max < 15.0 && max.is_finite());
     // For 48k CBR, also check byte closeness (allow small divergence due to remaining tone/Hybrid gaps)
     assert!((rs_n as i32 - c_n as i32).abs() <= 5);
+    // Byte-exact for Rust's own 48k impulse (regression)
+    let expected_impulse_prefix: [u8; 8] = [0xf8, 0x7f, 0x7d, 0x04, 0x38, 0x05, 0x2a, 0x21];
+    assert_eq!(&rs_buf[..8.min(rs_n)], &expected_impulse_prefix[..8.min(rs_n)], "byte prefix mismatch for 48k impulse");
+    const EXPECTED_IMPULSE_HEX: &str = "f87f7d0438052a212201282ac860c1888ac2a4220abeb23e0ab217c0a5711a31259a499a51a065b87a7bb247a10c297fba1169527fd742fb32cd0b54f6342c0c00daaf19bec71d433d353671d7e53a442267df33e6da7a8af01aeade58265a84ccc96cc961d342ae77d60b85d4ac4b5588eac4b5e51ac6832f7f82f1ac80415213aa2a8a7a023f0c15d0b1f6888da4aabe0f0e370e2b1e24d6c7d8d10074d6d1";
+    let expected = hex_to_bytes(EXPECTED_IMPULSE_HEX);
+    assert_eq!(rs_n, expected.len(), "fixture len mismatch for impulse");
+    assert_eq!(&rs_buf[..rs_n], &expected[..], "full byte-exact mismatch for impulse");
+    let mut rs_enc2 = RsEnc::new(sr, ch, RsApp::Audio).unwrap();
+    rs_enc2.bitrate_bps = br;
+    rs_enc2.use_cbr = true;
+    rs_enc2.complexity = 10;
+    let mut rs_buf2 = vec![0u8; 1276];
+    let rs_n2 = rs_enc2.encode(&pcm, fs, &mut rs_buf2).unwrap();
+    assert_eq!(rs_n, rs_n2);
+    assert_eq!(&rs_buf[..rs_n], &rs_buf2[..rs_n2]);
 }
 
 #[test]
