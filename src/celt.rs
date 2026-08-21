@@ -23,25 +23,83 @@ fn bits_to_bitrate(bits: i32, fs: i32, frame_size: i32) -> i32 {
 }
 
 const OPUS_BITRATE_MAX: i32 = -1;
-// Simplified compute_vbr stub - port of libopus compute_vbr with analysis/has_surround disabled
-// Returns base_target adjusted for transient etc., but tonality/activity boosts are no-ops when analysis.valid==false
 #[allow(clippy::too_many_arguments)]
-fn compute_vbr_stub(
+fn compute_vbr(
+    mode: &CeltMode,
+    analysis: &AnalysisInfo,
     base_target: i32,
-    _lm: i32,
-    _last_coded_bands: i32,
-    _c: i32,
-    _intensity: i32,
-    _stereo_saving: f32,
-    _tot_boost: i32,
-    _tf_estimate: f32,
+    lm: i32,
+    bitrate: i32,
+    last_coded_bands: i32,
+    c: i32,
+    intensity: i32,
+    constrained_vbr: bool,
+    stereo_saving: f32,
+    tot_boost: i32,
+    tf_estimate: f32,
+    pitch_change: i32,
+    max_depth: f32,
+    lfe: bool,
+    has_surround_mask: bool,
+    surround_masking: f32,
+    temporal_vbr: f32,
 ) -> i32 {
-    // When analysis is invalid and no surround, libopus compute_vbr reduces to:
-    // target = base_target + tot_boost - (19<<LM) + tf boost + floor clamping (handled outside)
-    // For stub, keep base_target; the caller will add tot_boost etc. separately if needed.
-    // To keep packet sizes variable, add a small tot_boost contribution.
-    base_target
+    let nb_ebands = mode.nb_ebands as i32;
+    let mut coded_bands = if last_coded_bands != 0 { last_coded_bands } else { nb_ebands };
+    coded_bands = coded_bands.clamp(0, nb_ebands);
+    let mut coded_bins = mode.e_bands[coded_bands as usize] as i32 * (1 << lm);
+    if c == 2 {
+        let idx = intensity.min(coded_bands) as usize;
+        coded_bins += mode.e_bands[idx] as i32 * (1 << lm);
+    }
+    let mut target = base_target;
+    if analysis.valid && analysis.activity < 0.4 {
+        target -= ((coded_bins << BITRES) as f32 * (0.4 - analysis.activity)) as i32;
+    }
+    if c == 2 {
+        let coded_stereo_bands = intensity.min(coded_bands);
+        let coded_stereo_dof = mode.e_bands[coded_stereo_bands as usize] as i32 * (1 << lm) - coded_stereo_bands;
+        let max_frac = (0.8 * coded_stereo_dof as f32) / coded_bins as f32;
+        let ss = stereo_saving.min(1.0);
+        let adjust = ((ss - 0.1).max(0.0) * coded_stereo_dof as f32 * (1 << BITRES) as f32 / 256.0) as i32;
+        let save = (max_frac * target as f32) as i32;
+        target -= save.min(adjust);
+    }
+    target += tot_boost - (19 << lm);
+    // tf boost (calibration 0.044 Q14)
+    target += ((tf_estimate - 0.044) * 2.0 * target as f32) as i32;
+    if analysis.valid && !lfe {
+        let mut tonal = (analysis.tonality - 0.15).max(0.0) - 0.12;
+        let mut tonal_target = target + ((coded_bins << BITRES) as f32 * 1.2 * tonal) as i32;
+        if pitch_change != 0 {
+            tonal_target += ((coded_bins << BITRES) as f32 * 0.8) as i32;
+        }
+        target = tonal_target;
+    }
+    if has_surround_mask && !lfe {
+        let surround_target = target + ((surround_masking * coded_bins as f32 * (1 << BITRES) as f32) / 1024.0) as i32;
+        target = target / 4.max(surround_target);
+        // actually IMAX(target/4, surround_target) per libopus
+        target = (target / 4).max(surround_target);
+    }
+    // floor depth
+    {
+        let bins = mode.e_bands[(nb_ebands - 2) as usize] as i32 * (1 << lm);
+        let floor_depth = ((c * bins * (1 << BITRES) as i32) as f32 * max_depth) as i32;
+        let floor_depth = floor_depth.max(target >> 2);
+        target = target.min(floor_depth);
+    }
+    if (!has_surround_mask || lfe) && constrained_vbr {
+        target = base_target + ((target - base_target) as f32 * 0.67) as i32;
+    }
+    if !has_surround_mask && tf_estimate < 0.2 {
+        let amount = 0.0000031 * (32000.min((96000 - bitrate).max(0)) as f32);
+        let tvbr_factor = temporal_vbr * amount / 1024.0;
+        target += (tvbr_factor * target as f32) as i32;
+    }
+    target.min(2 * base_target)
 }
+
 
 
 
@@ -2375,16 +2433,28 @@ impl CeltEncoder {
             // nbCompressedBytes is current max (after first VBR bound), effectiveBytes ~ vbr_rate>>(3+BITRES) for lambda already
             let nb_compressed_bytes_i32 = nb_compressed_bytes as i32;
             let mut target = if !hybrid {
-                // Simplified compute_vbr: base_target + tot_boost - (19<<LM) + tf boost
-                let mut t = base_target;
-                t += tot_boost - (19 << lm as i32);
-                t += ((tf_estimate * 2.0 - 0.088) * t as f32) as i32; // approx tf calibration
-                // Clamp doubling
-                t.min(2 * base_target)
+                compute_vbr(
+                    mode,
+                    &self.analysis,
+                    base_target,
+                    lm as i32,
+                    self.bitrate,
+                    self.last_coded_bands,
+                    channels as i32,
+                    self.intensity,
+                    self.constrained_vbr,
+                    stereo_saving,
+                    tot_boost,
+                    tf_estimate,
+                    0, // pitch_change stub
+                    0.0, // maxDepth stub
+                    false,
+                    false,
+                    0.0,
+                    0.0, // temporal_vbr stub
+                )
             } else {
                 let mut t = base_target;
-                // silk offset and tf estimate adjustments (libopus hybrid branch)
-                // For stub, use 0 offset
                 t += ((tf_estimate - 0.25) * 50.0 * (1 << BITRES) as f32) as i32;
                 if tf_estimate > 0.7 {
                     t = t.max(50 << BITRES);
