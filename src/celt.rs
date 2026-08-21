@@ -1535,8 +1535,10 @@ pub struct CeltEncoder {
     w_in_buf: FixedVec<f32, CELT_BUFSTRIDE>,
     w_freq: FixedVec<f32, CELT_W_FREQ>,
     w_band_e: FixedVec<f32, CELT_NB_X_CH>,
+    w_band_e2: FixedVec<f32, CELT_NB_X_CH>,
     w_x: FixedVec<f32, CELT_W_X_ENC>,
     w_band_log_e: FixedVec<f32, CELT_NB_X_CH>,
+    w_band_log_e2: FixedVec<f32, CELT_NB_X_CH>,
     w_error: FixedVec<f32, CELT_NB_X_CH>,
     w_tf_res: FixedVec<i32, CELT_NB_EBANDS>,
     w_cap: FixedVec<i32, CELT_NB_EBANDS>,
@@ -1677,6 +1679,7 @@ fn median5(v: &[f32]) -> f32 {
 fn dynalloc_analysis_simple(
     mode: &CeltMode,
     band_log_e: &[f32],
+    band_log_e2: Option<&[f32]>,
     old_band_e: &[f32],
     start: usize,
     end: usize,
@@ -1694,12 +1697,12 @@ fn dynalloc_analysis_simple(
 
     let nb = mode.nb_ebands;
     let mut follower: FixedVec<f32, CELT_NB_X_CH> = FixedVec::from_value(0.0f32, nb * channels);
-
     for c in 0..channels {
         let base = c * nb;
+        let src = if let Some(b2) = band_log_e2 { b2 } else { band_log_e };
         let mut band_log_e3: FixedVec<f32, CELT_NB_EBANDS> = FixedVec::from_value(0.0f32, end);
         for i in 0..end {
-            let mut e = band_log_e[base + i];
+            let mut e = src[base + i];
             if lm == 0 && i < 8 {
                 e = e.max(old_band_e[base + i]);
             }
@@ -1850,9 +1853,11 @@ impl CeltEncoder {
             w_in_buf: FixedVec::from_value(0.0, bufstride_x_ch),
             w_freq: FixedVec::from_value(0.0, frame_x_ch + 4),
             w_band_e: FixedVec::from_value(0.0, nb_x_ch),
+            w_band_e2: FixedVec::from_value(0.0, nb_x_ch),
 
             w_x: FixedVec::from_value(0.0, frame_x_ch + STRIDE_ACCESS_PAD),
             w_band_log_e: FixedVec::from_value(0.0, nb_x_ch),
+            w_band_log_e2: FixedVec::from_value(0.0, nb_x_ch),
             w_error: FixedVec::from_value(0.0, nb_x_ch),
             w_tf_res: FixedVec::from_value(0, nb_ebands),
             w_cap: FixedVec::from_value(0, nb_ebands),
@@ -2060,9 +2065,9 @@ impl CeltEncoder {
             self.syn_mem[channel_offset + syn_mem_size - overlap..channel_offset + syn_mem_size]
                 .copy_from_slice(&in_buf[in_buf_offset + frame_size..in_buf_offset + buf_stride]);
         }
-
         let freq = &mut self.w_freq[..frame_size * channels];
-        let (shift, b) = if is_transient {
+        // TEMP: force long for transient to avoid huge (dynalloc still simple) - proper fix is full dynalloc
+        let (shift, b) = if false && is_transient {
             (mode.max_lm, 1 << lm)
         } else {
             (mode.max_lm - lm, 1)
@@ -2209,7 +2214,30 @@ impl CeltEncoder {
                 short_blocks = true;
             }
         }
-
+        let second_mdct = short_blocks && self.complexity >= 8;
+        if second_mdct {
+            for c in 0..channels {
+                let c_buf = c * buf_stride;
+                let c_freq = c * frame_size;
+                mode.mdct.forward(
+                    &in_buf[c_buf..],
+                    &mut freq[c_freq..],
+                    mode.window,
+                    overlap,
+                    mode.max_lm - lm,
+                    1,
+                );
+            }
+            let band_e2 = &mut self.w_band_e2[..nb_ebands * channels];
+            compute_band_energies(mode, freq, band_e2, nb_ebands, channels, lm);
+            let band_log_e2 = &mut self.w_band_log_e2[..nb_ebands * channels];
+            crate::bands::amp2log2(mode, 0, nb_ebands, band_e2, band_log_e2, channels);
+            for c in 0..channels {
+                for i in 0..nb_ebands {
+                    band_log_e2[c * nb_ebands + i] += lm as f32 * 0.5;
+                }
+            }
+        }
         if short_blocks {
             let b = 1 << lm;
             let n = frame_size / b;
@@ -2357,9 +2385,15 @@ impl CeltEncoder {
         self.w_offsets[..nb_ebands].fill(0);
         let offsets = &mut self.w_offsets[..nb_ebands];
 
+        let band_log_e2_opt = if second_mdct {
+            Some(&self.w_band_log_e2[..nb_ebands * channels] as &[f32])
+        } else {
+            None
+        };
         dynalloc_analysis_simple(
             mode,
             band_log_e,
+            band_log_e2_opt,
             &self.old_band_e,
             start_band,
             nb_ebands,
