@@ -2483,11 +2483,12 @@ impl CeltEncoder {
             let mut nb_available = ((target + (1 << (BITRES + 2))) >> (BITRES + 3)) as usize;
             nb_available = nb_available.max(min_allowed as usize);
             nb_available = nb_available.min(nb_compressed_bytes);
-            let delta = target - vbr_rate;
+            let mut delta = target - vbr_rate;
             target = (nb_available as i32) << (BITRES + 3);
             if silence {
                 nb_available = 2;
                 target = 2 * 8 << BITRES;
+                delta = 0;
             }
             // Reservoir / drift update (libopus 2502-2529)
             if self.vbr_count < 970 {
