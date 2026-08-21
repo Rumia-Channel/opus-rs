@@ -2066,58 +2066,10 @@ impl CeltEncoder {
                 .copy_from_slice(&in_buf[in_buf_offset + frame_size..in_buf_offset + buf_stride]);
         }
         let freq = &mut self.w_freq[..frame_size * channels];
-        // TEMP: force long for transient to avoid huge (dynalloc still simple) - proper fix is full dynalloc
-        let (shift, b) = if false && is_transient {
-            (mode.max_lm, 1 << lm)
-        } else {
-            (mode.max_lm - lm, 1)
-        };
-        let n = frame_size / b;
-
-        for c in 0..channels {
-            let c_buf_offset = c * buf_stride;
-
-            if c == 0 && b == 1 && channels == 1 {
-                let mut max_val = 0.0f32;
-                let check_len = (frame_size + overlap).min(buf_stride);
-                for j in 0..check_len {
-                    max_val = max_val.max(in_buf[c_buf_offset + j].abs());
-                }
-            }
-
-            for i in 0..b {
-                mode.mdct.forward(
-                    &in_buf[c_buf_offset + i * n..],
-                    &mut freq[c * frame_size + i..],
-                    mode.window,
-                    overlap,
-                    shift,
-                    b,
-                );
-            }
-        }
-
         let band_e = &mut self.w_band_e[..nb_ebands * channels];
-        compute_band_energies(mode, freq, band_e, nb_ebands, channels, lm);
-
+        let band_log_e = &mut self.w_band_log_e[..nb_ebands * channels];
         let x_pad_end = (frame_size * channels + STRIDE_ACCESS_PAD).min(self.w_x.len());
         let x = &mut self.w_x[..x_pad_end];
-        normalise_bands(
-            mode,
-            freq,
-            x,
-            band_e,
-            nb_ebands,
-            channels,
-            (1 << lm) as usize,
-        );
-
-        if channels == 1 {
-            let _ = freq[0];
-        }
-
-        let band_log_e = &mut self.w_band_log_e[..nb_ebands * channels];
-        crate::bands::amp2log2(mode, start_band, nb_ebands, band_e, band_log_e, channels);
 
         let mut total_bits = explicit_total_bits.unwrap_or_else(|| (rc.buf.len() * 8) as i32);
         self.w_error[..nb_ebands * channels].fill(0.0);
@@ -2265,6 +2217,32 @@ impl CeltEncoder {
                 channels,
                 (1 << lm) as usize,
             );
+            crate::bands::amp2log2(mode, start_band, nb_ebands, band_e, band_log_e, channels);
+        } else {
+            // Long MDCT (non-transient)
+            for c in 0..channels {
+                let c_buf = c * buf_stride;
+                let c_freq = c * frame_size;
+                mode.mdct.forward(
+                    &in_buf[c_buf..],
+                    &mut freq[c_freq..],
+                    mode.window,
+                    overlap,
+                    mode.max_lm - lm,
+                    1,
+                );
+            }
+            compute_band_energies(mode, freq, band_e, nb_ebands, channels, lm);
+            normalise_bands(
+                mode,
+                freq,
+                x,
+                band_e,
+                nb_ebands,
+                channels,
+                (1 << lm) as usize,
+            );
+            crate::bands::amp2log2(mode, start_band, nb_ebands, band_e, band_log_e, channels);
         }
 
         let intra_ener = if self.complexity >= 4 {
