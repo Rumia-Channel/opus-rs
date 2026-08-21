@@ -61,13 +61,13 @@ fn compute_vbr(
         let coded_stereo_dof = mode.e_bands[coded_stereo_bands as usize] as i32 * (1 << lm) - coded_stereo_bands;
         let max_frac = (0.8 * coded_stereo_dof as f32) / coded_bins as f32;
         let ss = stereo_saving.min(1.0);
-        let adjust = ((ss - 0.1).max(0.0) * coded_stereo_dof as f32 * (1 << BITRES) as f32 / 256.0) as i32;
+        let adjust = ((ss - 0.1).max(0.0) * coded_stereo_dof as f32 * (1 << BITRES) as f32) as i32;
         let save = (max_frac * target as f32) as i32;
         target -= save.min(adjust);
     }
     target += tot_boost - (19 << lm);
-    // tf boost (calibration 0.044 Q14)
-    target += ((tf_estimate - 0.044) * 2.0 * target as f32) as i32;
+    // tf boost: libopus SHL32(MULT16_32_Q15(tf-0.044, target),1) collapses to (tf-0.044)*target in float
+    target += ((tf_estimate - 0.044) * target as f32) as i32;
     if analysis.valid && !lfe {
         let mut tonal = (analysis.tonality - 0.15).max(0.0) - 0.12;
         let mut tonal_target = target + ((coded_bins << BITRES) as f32 * 1.2 * tonal) as i32;
@@ -77,13 +77,11 @@ fn compute_vbr(
         target = tonal_target;
     }
     if has_surround_mask && !lfe {
-        let surround_target = target + ((surround_masking * coded_bins as f32 * (1 << BITRES) as f32) / 1024.0) as i32;
-        target = target / 4.max(surround_target);
-        // actually IMAX(target/4, surround_target) per libopus
+        let surround_target = target + (surround_masking * coded_bins as f32 * (1 << BITRES) as f32) as i32;
         target = (target / 4).max(surround_target);
     }
-    // floor depth
-    {
+    // floor depth: only clamp when max_depth is meaningful (>0); stub call passes 0 to avoid spurious 0.665*base
+    if max_depth > 0.0 {
         let bins = mode.e_bands[(nb_ebands - 2) as usize] as i32 * (1 << lm);
         let floor_depth = ((c * bins * (1 << BITRES) as i32) as f32 * max_depth) as i32;
         let floor_depth = floor_depth.max(target >> 2);
@@ -94,7 +92,7 @@ fn compute_vbr(
     }
     if !has_surround_mask && tf_estimate < 0.2 {
         let amount = 0.0000031 * (32000.min((96000 - bitrate).max(0)) as f32);
-        let tvbr_factor = temporal_vbr * amount / 1024.0;
+        let tvbr_factor = temporal_vbr * amount;
         target += (tvbr_factor * target as f32) as i32;
     }
     target.min(2 * base_target)
