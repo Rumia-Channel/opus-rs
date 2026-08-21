@@ -1692,6 +1692,8 @@ fn dynalloc_analysis_simple(
     lsb_depth: i32,
     vbr: bool,
     constrained_vbr: bool,
+    analysis: &AnalysisInfo,
+    surround_dynalloc: &[f32],
 ) {
     offsets.fill(0);
     if effective_bytes < (30 + 5 * lm) {
@@ -1767,7 +1769,16 @@ fn dynalloc_analysis_simple(
             follower[i] = (band_log_e[i] - follower[i]).max(0.0);
         }
     }
-
+    for i in start..end {
+        // C 1182-1183: follower = max(follower, surround_dynalloc)
+        follower[i] = follower[i].max(surround_dynalloc[i]);
+    }
+    // C 1184-1191: importance = floor(0.5+13*exp2(min(follower,4))) — kept for fidelity, not used for offsets
+    let mut _importance_tmp = [13i32; 21];
+    for i in start..end {
+        let v = follower[i].min(4.0);
+        _importance_tmp[i] = (0.5 + 13.0 * (2.0f32).powf(v)).floor() as i32;
+    }
     if (!vbr || constrained_vbr) && !is_transient {
         for i in start..end {
             follower[i] *= 0.5;
@@ -1783,6 +1794,14 @@ fn dynalloc_analysis_simple(
             follower[i] *= 0.5;
         }
     }
+    // C 1206-1222 tone compensation requires tone_freq/toneishness (analysis-dependent) — deferred, structure kept
+    // if toneishness > 0.98 { boost around tone_freq }
+    if analysis.valid {
+        // C 1226-1230: leak_boost
+        for i in start..end.min(19) {
+            follower[i] += (1.0 / 64.0) * analysis.leak_boost[i] as f32;
+        }
+    }
     // effBytes>320 boost (C 1232) — trivial, kept
     if effective_bytes > 320 {
         let add = (1.5f32).min(1e-3 * (effective_bytes as f32 - 320.0));
@@ -1790,9 +1809,7 @@ fn dynalloc_analysis_simple(
             follower[start] += add;
         }
     }
-    // TODO(deferred): surround_dynalloc MAX (1182-1183), importance (1184-1191),
-    // tone compensation (1206-1222), leak_boost (1226-1230) require analysis/toneishness
-    // plumbing not yet ported. Surround currently 0, importance unused for offsets.
+    // TODO(deferred): tone compensation (1206-1222) requires toneishness plumbing
 
     let mut tot_boost = 0i32;
     for i in start..end {
@@ -2393,6 +2410,9 @@ impl CeltEncoder {
         } else {
             None
         };
+        // Surround masking dynalloc (C 2112-2140) — full computation requires energy_mask/hybrid logic,
+        // currently zeroed as neutral input to dynalloc's MAX step (1182). Wired for future port.
+        let surround_dynalloc = [0.0f32; 21];
         dynalloc_analysis_simple(
             mode,
             band_log_e,
@@ -2409,6 +2429,8 @@ impl CeltEncoder {
             self.lsb_depth,
             self.vbr,
             self.constrained_vbr,
+            &self.analysis,
+            &surround_dynalloc,
         );
 
         let mut dynalloc_logp = 6i32;
