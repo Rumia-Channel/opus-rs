@@ -13,6 +13,113 @@ use crate::rate::{BITRES, clt_compute_allocation};
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
 use crate::fixedvec::FixedVec;
+#[inline]
+fn bitrate_to_bits(bitrate: i32, fs: i32, frame_size: i32) -> i32 {
+    bitrate * 6 / (6 * fs / frame_size)
+}
+#[inline]
+fn bits_to_bitrate(bits: i32, fs: i32, frame_size: i32) -> i32 {
+    bits * (6 * fs / frame_size) / 6
+}
+
+const OPUS_BITRATE_MAX: i32 = -1;
+#[allow(clippy::too_many_arguments)]
+fn compute_vbr(
+    mode: &CeltMode,
+    analysis: &AnalysisInfo,
+    base_target: i32,
+    lm: i32,
+    bitrate: i32,
+    last_coded_bands: i32,
+    c: i32,
+    intensity: i32,
+    constrained_vbr: bool,
+    stereo_saving: f32,
+    tot_boost: i32,
+    tf_estimate: f32,
+    pitch_change: i32,
+    max_depth: f32,
+    lfe: bool,
+    has_surround_mask: bool,
+    surround_masking: f32,
+    temporal_vbr: f32,
+) -> i32 {
+    let nb_ebands = mode.nb_ebands as i32;
+    let mut coded_bands = if last_coded_bands != 0 { last_coded_bands } else { nb_ebands };
+    coded_bands = coded_bands.clamp(0, nb_ebands);
+    let mut coded_bins = mode.e_bands[coded_bands as usize] as i32 * (1 << lm);
+    if c == 2 {
+        let idx = intensity.min(coded_bands) as usize;
+        coded_bins += mode.e_bands[idx] as i32 * (1 << lm);
+    }
+    let mut target = base_target;
+    if analysis.valid && analysis.activity < 0.4 {
+        target -= ((coded_bins << BITRES) as f32 * (0.4 - analysis.activity)) as i32;
+    }
+    if c == 2 {
+        let coded_stereo_bands = intensity.min(coded_bands);
+        let coded_stereo_dof = mode.e_bands[coded_stereo_bands as usize] as i32 * (1 << lm) - coded_stereo_bands;
+        let max_frac = (0.8 * coded_stereo_dof as f32) / coded_bins as f32;
+        let ss = stereo_saving.min(1.0);
+        let adjust = ((ss - 0.1).max(0.0) * coded_stereo_dof as f32 * (1 << BITRES) as f32) as i32;
+        let save = (max_frac * target as f32) as i32;
+        target -= save.min(adjust);
+    }
+    target += tot_boost - (19 << lm);
+    // tf boost: libopus SHL32(MULT16_32_Q15(tf-0.044, target),1) collapses to (tf-0.044)*target in float
+    target += ((tf_estimate - 0.044) * target as f32) as i32;
+    if analysis.valid && !lfe {
+        let mut tonal = (analysis.tonality - 0.15).max(0.0) - 0.12;
+        let mut tonal_target = target + ((coded_bins << BITRES) as f32 * 1.2 * tonal) as i32;
+        if pitch_change != 0 {
+            tonal_target += ((coded_bins << BITRES) as f32 * 0.8) as i32;
+        }
+        target = tonal_target;
+    }
+    if has_surround_mask && !lfe {
+        let surround_target = target + (surround_masking * coded_bins as f32 * (1 << BITRES) as f32) as i32;
+        target = (target / 4).max(surround_target);
+    }
+    // floor depth: only clamp when max_depth is meaningful (>0); stub call passes 0 to avoid spurious 0.665*base
+    if max_depth > 0.0 {
+        let bins = mode.e_bands[(nb_ebands - 2) as usize] as i32 * (1 << lm);
+        let floor_depth = ((c * bins * (1 << BITRES) as i32) as f32 * max_depth) as i32;
+        let floor_depth = floor_depth.max(target >> 2);
+        target = target.min(floor_depth);
+    }
+    if (!has_surround_mask || lfe) && constrained_vbr {
+        target = base_target + ((target - base_target) as f32 * 0.67) as i32;
+    }
+    if !has_surround_mask && tf_estimate < 0.2 {
+        let amount = 0.0000031 * (32000.min((96000 - bitrate).max(0)) as f32);
+        let tvbr_factor = temporal_vbr * amount;
+        target += (tvbr_factor * target as f32) as i32;
+    }
+    target.min(2 * base_target)
+}
+const EMEANS_F: [f32; 25] = [
+    6.4375, 6.25, 5.75, 5.3125, 5.0625, 4.8125, 4.5, 4.375, 4.875, 4.6875, 4.5625, 4.4375, 4.875, 4.625,
+    4.3125, 4.5, 4.375, 4.625, 4.75, 4.4375, 3.75, 3.75, 3.75, 3.75, 3.75,
+];
+fn compute_max_depth(mode: &CeltMode, band_log_e: &[f32], nb_ebands: usize, c: usize, end: usize, lsb_depth: i32) -> f32 {
+    let mut max_depth: f32 = -31.9;
+    for ch in 0..c {
+        for i in 0..end {
+            let log_n = mode.log_n[i] as f32;
+            let e_mean = if i < EMEANS_F.len() { EMEANS_F[i] } else { 0.0 };
+            let noise_floor = 0.0625 * log_n + 0.5 + (9 - lsb_depth) as f32 - e_mean + 0.0062 * ((i + 5) * (i + 5)) as f32;
+            let v = band_log_e[ch * nb_ebands + i] - noise_floor;
+            if v > max_depth {
+                max_depth = v;
+            }
+        }
+    }
+    max_depth
+}
+
+
+
+
 
 // --- Heap-free buffer capacity constants (all sized for the worst case:
 //     2 channels, 48 kHz, max frame). Runtime construction uses smaller logical
@@ -1413,6 +1520,17 @@ pub struct CeltEncoder {
     old_band_e3: FixedVec<f32, CELT_NB_X_CH>,
     last_band_log_e: FixedVec<f32, CELT_NB_X_CH>,
     delayed_intra: f32,
+    lsb_depth: i32,
+    overlap_max: f32,
+    bitrate: i32,
+    vbr: bool,
+    constrained_vbr: bool,
+    vbr_reservoir: i32,
+    vbr_drift: i32,
+    vbr_offset: i32,
+    vbr_count: i32,
+    spec_avg: f32,
+    stereo_saving: f32,
 
     w_in_buf: FixedVec<f32, CELT_BUFSTRIDE>,
     w_freq: FixedVec<f32, CELT_W_FREQ>,
@@ -1717,6 +1835,17 @@ impl CeltEncoder {
             old_band_e3: FixedVec::from_value(0.0, nb_x_ch),
             last_band_log_e: FixedVec::from_value(0.0, nb_x_ch),
             delayed_intra: 0.0,
+            lsb_depth: 24,
+            overlap_max: 0.0,
+            bitrate: OPUS_BITRATE_MAX,
+            vbr: false,
+            constrained_vbr: true,
+            vbr_reservoir: 0,
+            vbr_drift: 0,
+            vbr_offset: 0,
+            vbr_count: 0,
+            spec_avg: 0.0,
+            stereo_saving: 0.0,
 
             w_in_buf: FixedVec::from_value(0.0, bufstride_x_ch),
             w_freq: FixedVec::from_value(0.0, frame_x_ch + 4),
@@ -1748,7 +1877,7 @@ impl CeltEncoder {
     }
 
     pub fn encode(&mut self, pcm: &[f32], frame_size: usize, rc: &mut RangeCoder) {
-        self.encode_impl(pcm, frame_size, rc, 0, None)
+        self.encode_impl(pcm, frame_size, rc, 0, None, false)
     }
 
     pub fn encode_with_start_band(
@@ -1758,7 +1887,7 @@ impl CeltEncoder {
         rc: &mut RangeCoder,
         start_band: usize,
     ) {
-        self.encode_impl(pcm, frame_size, rc, start_band, None)
+        self.encode_impl(pcm, frame_size, rc, start_band, None, false)
     }
 
     pub fn encode_with_budget(
@@ -1769,7 +1898,43 @@ impl CeltEncoder {
         start_band: usize,
         total_bits: i32,
     ) {
-        self.encode_impl(pcm, frame_size, rc, start_band, Some(total_bits))
+        self.encode_impl(pcm, frame_size, rc, start_band, Some(total_bits), false)
+    }
+
+    pub fn encode_with_budget_vbr(
+        &mut self,
+        pcm: &[f32],
+        frame_size: usize,
+        rc: &mut RangeCoder,
+        start_band: usize,
+        total_bits: i32,
+        is_vbr: bool,
+    ) {
+        self.encode_impl(
+            pcm,
+            frame_size,
+            rc,
+            start_band,
+            Some(total_bits),
+            is_vbr,
+        )
+    }
+
+    pub fn set_lsb_depth(&mut self, depth: i32) {
+        self.lsb_depth = depth.clamp(8, 24);
+    }
+
+    pub fn get_lsb_depth(&self) -> i32 {
+        self.lsb_depth
+    }
+    pub fn set_bitrate(&mut self, bitrate: i32) {
+        self.bitrate = bitrate;
+    }
+    pub fn set_vbr(&mut self, vbr: bool) {
+        self.vbr = vbr;
+    }
+    pub fn set_constrained_vbr(&mut self, cvbr: bool) {
+        self.constrained_vbr = cvbr;
     }
 
     fn encode_impl(
@@ -1779,6 +1944,7 @@ impl CeltEncoder {
         rc: &mut RangeCoder,
         start_band: usize,
         explicit_total_bits: Option<i32>,
+        is_vbr: bool,
     ) {
         let mode = self.mode;
         let channels = self.channels;
@@ -1948,14 +2114,76 @@ impl CeltEncoder {
         let band_log_e = &mut self.w_band_log_e[..nb_ebands * channels];
         crate::bands::amp2log2(mode, start_band, nb_ebands, band_e, band_log_e, channels);
 
-        let total_bits = explicit_total_bits.unwrap_or_else(|| (rc.buf.len() * 8) as i32);
+        let mut total_bits = explicit_total_bits.unwrap_or_else(|| (rc.buf.len() * 8) as i32);
         self.w_error[..nb_ebands * channels].fill(0.0);
         let error = &mut self.w_error[..nb_ebands * channels];
 
-        let tell = rc.tell();
-        let silence = false;
-        if tell == 1 {
+        // --- Silence detection (port of libopus celt_encoder.c: sample_max / overlap_max / lsb_depth) ---
+        let mut sample_max = self.overlap_max;
+        let n_nonoverlap = frame_size.saturating_sub(overlap);
+        for c in 0..channels {
+            let base = c * frame_size;
+            for i in 0..n_nonoverlap {
+                let v = pcm[base + i].abs();
+                if v > sample_max {
+                    sample_max = v;
+                }
+            }
+        }
+        let mut new_overlap_max = 0.0f32;
+        for c in 0..channels {
+            let base = c * frame_size;
+            for i in n_nonoverlap..frame_size {
+                let v = pcm[base + i].abs();
+                if v > new_overlap_max {
+                    new_overlap_max = v;
+                }
+            }
+        }
+        self.overlap_max = new_overlap_max;
+        if new_overlap_max > sample_max {
+            sample_max = new_overlap_max;
+        }
+        let threshold = 1.0 / ((1 << self.lsb_depth) as f32);
+        let mut silence = sample_max <= threshold;
+        let tell_initial = rc.tell();
+        let nb_filled_bytes_initial = ((tell_initial + 4) >> 3).max(0) as usize;
+        let mut nb_compressed_bytes = (total_bits / 8) as usize;
+        if tell_initial == 1 {
             rc.encode_bit_logp(silence, 15);
+        } else {
+            silence = false;
+        }
+        if silence {
+            if is_vbr {
+                let target_bytes = nb_filled_bytes_initial + 2;
+                if target_bytes < nb_compressed_bytes {
+                    nb_compressed_bytes = target_bytes;
+                    total_bits = (nb_compressed_bytes * 8) as i32;
+                    rc.shrink(nb_compressed_bytes as u32);
+                }
+            }
+            let cur_tell = rc.tell();
+            let new_tell = (nb_compressed_bytes * 8) as i32;
+            rc.nbits_total += new_tell - cur_tell;
+        }
+        // General VBR max bound (libopus 1936-1961) - constrained VBR
+        if self.vbr && self.bitrate != OPUS_BITRATE_MAX {
+            let vbr_rate = bitrate_to_bits(self.bitrate, mode.fs, frame_size as i32) << BITRES;
+            let nb_available = nb_compressed_bytes.saturating_sub(nb_filled_bytes_initial);
+            if self.constrained_vbr {
+                let vbr_bound = vbr_rate;
+                let max_allowed = std::cmp::min(
+                    std::cmp::max(if tell_initial == 1 { 2 } else { 0 }, (vbr_rate + vbr_bound - self.vbr_reservoir) >> (BITRES + 3)),
+                    nb_available as i32,
+                );
+                if (max_allowed as usize) < nb_available {
+                    nb_compressed_bytes = nb_filled_bytes_initial + max_allowed as usize;
+                    total_bits = (nb_compressed_bytes * 8) as i32;
+                    rc.shrink(nb_compressed_bytes as u32);
+                }
+            }
+            // effectiveBytes would be vbr_rate>>(3+BITRES) for later lambda, but total_bits already reflects bound
         }
 
         if start_band == 0 && !silence && rc.tell() + 16 <= total_bits {
@@ -2193,6 +2421,104 @@ impl CeltEncoder {
         if rc.tell_frac() + (6 << BITRES) <= total_bits_bitres - total_boost {
             rc.encode_icdf(alloc_trim, &TRIM_ICDF, 7);
         }
+        // Second VBR: compute target via simplified compute_vbr (libopus 2436-2534)
+        // This makes packet size variable for VBR (beyond silence) while keeping reservoir in sync
+        if self.vbr && self.bitrate != OPUS_BITRATE_MAX {
+            let vbr_rate = bitrate_to_bits(self.bitrate, mode.fs, frame_size as i32) << BITRES;
+            let hybrid = start_band != 0;
+            let lm_diff = mode.max_lm as i32 - lm as i32;
+            let mut base_target = if !hybrid {
+                vbr_rate - ((40 * channels as i32 + 20) << BITRES)
+            } else {
+                (0).max(vbr_rate - ((9 * channels as i32 + 4) << BITRES))
+            };
+            if self.constrained_vbr {
+                base_target += self.vbr_offset >> lm_diff;
+            }
+            let tot_boost = total_boost;
+            let tf_calib = 0; // simplified
+            let cur_tell_frac = rc.tell_frac();
+            let tell_initial_frac = (tell_initial as i32) << BITRES; // approx ec_tell_frac initial
+            let min_allowed = {
+                let a = ((cur_tell_frac + tot_boost + (1 << (BITRES + 3)) - 1) >> (BITRES + 3)) + 2;
+                if hybrid {
+                    let b = ((tell_initial_frac + (37 << BITRES) + tot_boost + (1 << (BITRES + 3)) - 1) >> (BITRES + 3));
+                    a.max(b)
+                } else {
+                    a
+                }
+            };
+            // nbCompressedBytes is current max (after first VBR bound), effectiveBytes ~ vbr_rate>>(3+BITRES) for lambda already
+            let max_depth = compute_max_depth(mode, band_log_e, nb_ebands, channels, nb_ebands, self.lsb_depth);
+            let mut target = if !hybrid {
+                compute_vbr(
+                    mode,
+                    &self.analysis,
+                    base_target,
+                    lm as i32,
+                    self.bitrate,
+                    self.last_coded_bands,
+                    channels as i32,
+                    self.intensity,
+                    self.constrained_vbr,
+                    stereo_saving,
+                    tot_boost,
+                    tf_estimate,
+                    0, // pitch_change stub
+                    max_depth,
+                    false,
+                    false,
+                    0.0,
+                    0.0, // temporal_vbr stub
+                )
+            } else {
+                let mut t = base_target;
+                t += ((tf_estimate - 0.25) * 50.0 * (1 << BITRES) as f32) as i32;
+                if tf_estimate > 0.7 {
+                    t = t.max(50 << BITRES);
+                }
+                t
+            };
+            target += cur_tell_frac;
+            let mut nb_available = ((target + (1 << (BITRES + 2))) >> (BITRES + 3)) as usize;
+            nb_available = nb_available.max(min_allowed as usize);
+            nb_available = nb_available.min(nb_compressed_bytes);
+            let mut delta = target - vbr_rate;
+            target = (nb_available as i32) << (BITRES + 3);
+            if silence {
+                nb_available = 2;
+                target = 2 * 8 << BITRES;
+                delta = 0;
+            }
+            // Reservoir / drift update (libopus 2502-2529)
+            if self.vbr_count < 970 {
+                self.vbr_count += 1;
+            }
+            let alpha = if self.vbr_count < 970 {
+                // celt_rcp((vbr_count+20)<<16) approx 1/(vbr_count+20) in Q15
+                let v = self.vbr_count + 20;
+                (65536 / v) as i32 // Q15 approx
+            } else {
+                33 // QCONST16(0.001,15) ~33
+            };
+            if self.constrained_vbr {
+                self.vbr_reservoir += target - vbr_rate;
+                // drift: MULT16_32_Q15(alpha, delta - offset - drift)
+                let delta_minus = delta - self.vbr_offset - self.vbr_drift;
+                self.vbr_drift += ((alpha as i64 * delta_minus as i64) >> 15) as i32;
+                self.vbr_offset = -self.vbr_drift;
+            }
+            if self.constrained_vbr && self.vbr_reservoir < 0 {
+                let adjust = (-self.vbr_reservoir) / (8 << BITRES);
+                if !silence {
+                    nb_available = (nb_available as i32 + adjust) as usize;
+                }
+                self.vbr_reservoir = 0;
+            }
+            nb_compressed_bytes = nb_compressed_bytes.min(nb_available);
+            total_bits = (nb_compressed_bytes * 8) as i32;
+            rc.shrink(nb_compressed_bytes as u32);
+        }
 
         let mut intensity = self.intensity;
         self.w_pulses[..nb_ebands].fill(0);
@@ -2310,6 +2636,12 @@ impl CeltEncoder {
             rc,
             channels,
         );
+
+        if silence {
+            for v in self.old_band_e[..channels * nb_ebands].iter_mut() {
+                *v = -28.0;
+            }
+        }
 
         if resynth {
             let band_amp_synth = &mut self.w_band_amp_synth[..nb_ebands * channels];
