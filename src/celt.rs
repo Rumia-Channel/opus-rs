@@ -1413,6 +1413,8 @@ pub struct CeltEncoder {
     old_band_e3: FixedVec<f32, CELT_NB_X_CH>,
     last_band_log_e: FixedVec<f32, CELT_NB_X_CH>,
     delayed_intra: f32,
+    lsb_depth: i32,
+    overlap_max: f32,
 
     w_in_buf: FixedVec<f32, CELT_BUFSTRIDE>,
     w_freq: FixedVec<f32, CELT_W_FREQ>,
@@ -1717,6 +1719,8 @@ impl CeltEncoder {
             old_band_e3: FixedVec::from_value(0.0, nb_x_ch),
             last_band_log_e: FixedVec::from_value(0.0, nb_x_ch),
             delayed_intra: 0.0,
+            lsb_depth: 24,
+            overlap_max: 0.0,
 
             w_in_buf: FixedVec::from_value(0.0, bufstride_x_ch),
             w_freq: FixedVec::from_value(0.0, frame_x_ch + 4),
@@ -1748,7 +1752,7 @@ impl CeltEncoder {
     }
 
     pub fn encode(&mut self, pcm: &[f32], frame_size: usize, rc: &mut RangeCoder) {
-        self.encode_impl(pcm, frame_size, rc, 0, None)
+        self.encode_impl(pcm, frame_size, rc, 0, None, false)
     }
 
     pub fn encode_with_start_band(
@@ -1758,7 +1762,7 @@ impl CeltEncoder {
         rc: &mut RangeCoder,
         start_band: usize,
     ) {
-        self.encode_impl(pcm, frame_size, rc, start_band, None)
+        self.encode_impl(pcm, frame_size, rc, start_band, None, false)
     }
 
     pub fn encode_with_budget(
@@ -1769,7 +1773,34 @@ impl CeltEncoder {
         start_band: usize,
         total_bits: i32,
     ) {
-        self.encode_impl(pcm, frame_size, rc, start_band, Some(total_bits))
+        self.encode_impl(pcm, frame_size, rc, start_band, Some(total_bits), false)
+    }
+
+    pub fn encode_with_budget_vbr(
+        &mut self,
+        pcm: &[f32],
+        frame_size: usize,
+        rc: &mut RangeCoder,
+        start_band: usize,
+        total_bits: i32,
+        is_vbr: bool,
+    ) {
+        self.encode_impl(
+            pcm,
+            frame_size,
+            rc,
+            start_band,
+            Some(total_bits),
+            is_vbr,
+        )
+    }
+
+    pub fn set_lsb_depth(&mut self, depth: i32) {
+        self.lsb_depth = depth.clamp(8, 24);
+    }
+
+    pub fn get_lsb_depth(&self) -> i32 {
+        self.lsb_depth
     }
 
     fn encode_impl(
@@ -1779,6 +1810,7 @@ impl CeltEncoder {
         rc: &mut RangeCoder,
         start_band: usize,
         explicit_total_bits: Option<i32>,
+        is_vbr: bool,
     ) {
         let mode = self.mode;
         let channels = self.channels;
@@ -1948,14 +1980,58 @@ impl CeltEncoder {
         let band_log_e = &mut self.w_band_log_e[..nb_ebands * channels];
         crate::bands::amp2log2(mode, start_band, nb_ebands, band_e, band_log_e, channels);
 
-        let total_bits = explicit_total_bits.unwrap_or_else(|| (rc.buf.len() * 8) as i32);
+        let mut total_bits = explicit_total_bits.unwrap_or_else(|| (rc.buf.len() * 8) as i32);
         self.w_error[..nb_ebands * channels].fill(0.0);
         let error = &mut self.w_error[..nb_ebands * channels];
 
-        let tell = rc.tell();
-        let silence = false;
-        if tell == 1 {
+        // --- Silence detection (port of libopus celt_encoder.c: sample_max / overlap_max / lsb_depth) ---
+        let mut sample_max = self.overlap_max;
+        let n_nonoverlap = frame_size.saturating_sub(overlap);
+        for c in 0..channels {
+            let base = c * frame_size;
+            for i in 0..n_nonoverlap {
+                let v = pcm[base + i].abs();
+                if v > sample_max {
+                    sample_max = v;
+                }
+            }
+        }
+        let mut new_overlap_max = 0.0f32;
+        for c in 0..channels {
+            let base = c * frame_size;
+            for i in n_nonoverlap..frame_size {
+                let v = pcm[base + i].abs();
+                if v > new_overlap_max {
+                    new_overlap_max = v;
+                }
+            }
+        }
+        self.overlap_max = new_overlap_max;
+        if new_overlap_max > sample_max {
+            sample_max = new_overlap_max;
+        }
+        let threshold = 1.0 / ((1 << self.lsb_depth) as f32);
+        let mut silence = sample_max <= threshold;
+        let tell_initial = rc.tell();
+        let nb_filled_bytes_initial = ((tell_initial + 4) >> 3).max(0) as usize;
+        let mut nb_compressed_bytes = (total_bits / 8) as usize;
+        if tell_initial == 1 {
             rc.encode_bit_logp(silence, 15);
+        } else {
+            silence = false;
+        }
+        if silence {
+            if is_vbr {
+                let target_bytes = nb_filled_bytes_initial + 2;
+                if target_bytes < nb_compressed_bytes {
+                    nb_compressed_bytes = target_bytes;
+                    total_bits = (nb_compressed_bytes * 8) as i32;
+                    rc.shrink(nb_compressed_bytes as u32);
+                }
+            }
+            let cur_tell = rc.tell();
+            let new_tell = (nb_compressed_bytes * 8) as i32;
+            rc.nbits_total += new_tell - cur_tell;
         }
 
         if start_band == 0 && !silence && rc.tell() + 16 <= total_bits {
@@ -2310,6 +2386,12 @@ impl CeltEncoder {
             rc,
             channels,
         );
+
+        if silence {
+            for v in self.old_band_e[..channels * nb_ebands].iter_mut() {
+                *v = -28.0;
+            }
+        }
 
         if resynth {
             let band_amp_synth = &mut self.w_band_amp_synth[..nb_ebands * channels];

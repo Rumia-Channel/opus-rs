@@ -761,12 +761,14 @@ impl OpusEncoder {
             };
 
             if self.rc.tell() <= total_packet_bits {
-                self.celt_enc.encode_with_budget(
+                let is_vbr = !self.use_cbr;
+                self.celt_enc.encode_with_budget_vbr(
                     celt_input,
                     frame_size,
                     &mut self.rc,
                     start_band,
                     total_packet_bits,
+                    is_vbr,
                 );
             }
         }
@@ -833,10 +835,11 @@ impl OpusEncoder {
             return Ok(target_total.min(output.len()));
         }
 
-        let payload_len = n_bytes - 1;
+        // For CELT/Hybrid, respect possible VBR shrink performed by CeltEncoder (e.g. silence)
+        let payload_len = (self.rc.storage as usize).min(output.len() - 1);
         output[1..1 + payload_len].copy_from_slice(&self.rc.buf[..payload_len]);
         self.prev_enc_mode = Some(mode);
-        Ok(n_bytes)
+        Ok(payload_len + 1)
     }
 }
 
