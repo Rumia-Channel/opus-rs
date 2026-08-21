@@ -741,9 +741,12 @@ impl OpusEncoder {
             0
         };
 
-        // libopus parity: adjust nbCompressedBytes for CELT/Hybrid based on tell (opus_encoder.c:1913-1921)
+        // libopus parity: adjust nbCompressedBytes for CELT/Hybrid based on tell (celt_encoder.c:1913-1921)
         // tmp = bitrate*frame_size + tell*Fs; nbCompressed = (tmp+4*Fs)/(8*Fs)
-        if mode != OpusMode::SilkOnly {
+        // This is the CBR branch (vbr==0) in celt_encoder.c; for VBR the encoder
+        // does *not* do this adjustment - it uses the vbr_bound logic instead.
+        // Doing it for VBR would double-shrink and corrupt the budget.
+        if mode != OpusMode::SilkOnly && self.use_cbr {
             let tell = self.rc.tell();
             if tell > 1 {
                 let tmp = self.bitrate_bps as i64 * frame_size as i64 + tell as i64 * self.sampling_rate as i64;
@@ -757,7 +760,6 @@ impl OpusEncoder {
                 }
             }
         }
-
         if mode == OpusMode::CeltOnly || mode == OpusMode::Hybrid {
             self.celt_enc.complexity = self.complexity;
             let start_band = if mode == OpusMode::Hybrid { 17 } else { 0 };

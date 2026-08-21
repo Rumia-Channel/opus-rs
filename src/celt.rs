@@ -2147,6 +2147,7 @@ impl CeltEncoder {
         let threshold = 1.0 / ((1 << self.lsb_depth) as f32);
         let mut silence = sample_max <= threshold;
         let tell_initial = rc.tell();
+        let tell_initial_frac = rc.tell_frac();
         let nb_filled_bytes_initial = ((tell_initial + 4) >> 3).max(0) as usize;
         let mut nb_compressed_bytes = (total_bits / 8) as usize;
         if tell_initial == 1 {
@@ -2192,7 +2193,7 @@ impl CeltEncoder {
                 let qg = (gain1 / 0.09375 - 1.0 + 0.5).floor() as i32;
                 let qg = qg.clamp(0, 7);
                 let pi = (pitch_index + 1) as u32;
-                let octave = 31 - pi.leading_zeros();
+                let octave = 32 - pi.leading_zeros();
                 let octave = (octave as i32 - 5).max(0) as u32;
                 rc.enc_uint(octave, 6);
                 rc.enc_bits(pi - (16 << octave), 4 + octave);
@@ -2438,7 +2439,8 @@ impl CeltEncoder {
             let tot_boost = total_boost;
             let tf_calib = 0; // simplified
             let cur_tell_frac = rc.tell_frac();
-            let tell_initial_frac = (tell_initial as i32) << BITRES; // approx ec_tell_frac initial
+            // Use the exact initial tell_frac captured at entry (libopus tell0_frac),
+            // not tell_initial<<BITRES which loses the fractional part.
             let min_allowed = {
                 let a = ((cur_tell_frac + tot_boost + (1 << (BITRES + 3)) - 1) >> (BITRES + 3)) + 2;
                 if hybrid {
@@ -2495,16 +2497,17 @@ impl CeltEncoder {
                 self.vbr_count += 1;
             }
             let alpha = if self.vbr_count < 970 {
-                // celt_rcp((vbr_count+20)<<16) approx 1/(vbr_count+20) in Q15
+                // celt_rcp((vbr_count+20)<<16) in Q15 is 32768/(vbr_count+20)
                 let v = self.vbr_count + 20;
-                (65536 / v) as i32 // Q15 approx
+                (32768 / v) as i32 // Q15
             } else {
                 33 // QCONST16(0.001,15) ~33
             };
             if self.constrained_vbr {
                 self.vbr_reservoir += target - vbr_rate;
-                // drift: MULT16_32_Q15(alpha, delta - offset - drift)
-                let delta_minus = delta - self.vbr_offset - self.vbr_drift;
+                // drift: MULT16_32_Q15(alpha, delta*(1<<lm_diff) - offset - drift) (libopus 2516)
+                let delta_scaled = delta * (1 << lm_diff);
+                let delta_minus = delta_scaled - self.vbr_offset - self.vbr_drift;
                 self.vbr_drift += ((alpha as i64 * delta_minus as i64) >> 15) as i32;
                 self.vbr_offset = -self.vbr_drift;
             }
