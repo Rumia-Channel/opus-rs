@@ -2910,17 +2910,19 @@ impl CeltDecoder {
             lm = 0;
         }
 
-        let tell = rc.tell();
+        let mut tell = rc.tell();
         let mut silence = false;
         if tell >= total_bits {
             silence = true;
         } else if tell == 1 {
             silence = rc.decode_bit_logp(15);
         }
-
         if silence {
-            pcm[..api_frame_size * channels].fill(0.0);
-            return api_frame_size;
+            // Pretend we've read all remaining bits (libopus celt_decoder.c:1324-1328)
+            // so that every subsequent `tell+...<=total_bits` guard correctly
+            // sees no budget left and decoding proceeds with defaults.
+            tell = total_bits;
+            rc.nbits_total += tell - rc.tell();
         }
 
         let mut pf_on = false;
@@ -3126,7 +3128,6 @@ impl CeltDecoder {
         if anti_collapse_rsv > 0 {
             anti_collapse_on = rc.dec_bits(1) != 0;
         }
-
         unquant_energy_finalise(
             mode,
             start_band,
@@ -3155,30 +3156,47 @@ impl CeltDecoder {
                 self.rng,
             );
         }
-
-        // Recompute band_amp after unquant_energy_finalise, which adjusts old_band_e.
-        // (Mirrors the encoder's resynth path: log2amp is called after quant_energy_finalise.)
-        log2amp(mode, nb_ebands, band_amp, &self.old_band_e, channels);
+        if silence {
+            // libopus celt_decoder.c:1530-1534 — silence frames carry no energy;
+            // force the long-term predictor to a noise floor so the next packet
+            // decodes cleanly. Without this the decoder's `oldBandE` retains
+            // the previous frame's energies and the next decode diverges, which
+            // is the reported "一時的に破壊" (temporarily destroyed) symptom.
+            for v in self.old_band_e[..channels * nb_ebands].iter_mut() {
+                *v = -28.0;
+            }
+        }
+        // For silence the MDCT synthesis must still run so that overlap,
+        // pre-emphasis and prefilter states advance, but with zeroed
+        // frequency bins (libopus denormalise_bands(silence=1) sets
+        // bound=0/start=end=0). Filling `w_freq` with zeros and skipping
+        // denormalisation achieves the same effect without passing a
+        // dedicated `silence` flag through `denormalise_bands`.
         self.w_freq[..frame_size * channels].fill(0.0);
         let freq = &mut self.w_freq[..frame_size * channels];
-        denormalise_bands(
-            mode,
-            x,
-            freq,
-            band_amp,
-            start_band,
-            end_band,
-            channels,
-            (1 << lm) as usize,
-        );
-        // Anti-aliasing: zero MDCT bins above the output Nyquist when
-        // downsampling (libopus denormalise_bands `if(downsample!=1)
-        // bound=IMIN(bound,N/downsample)`).
-        if self.downsample > 1 {
-            let bound = frame_size / self.downsample;
-            for c in 0..channels {
-                for i in bound..frame_size {
-                    freq[c * frame_size + i] = 0.0;
+        if !silence {
+            // Recompute band_amp after unquant_energy_finalise, which adjusts old_band_e.
+            // (Mirrors the encoder's resynth path: log2amp is called after quant_energy_finalise.)
+            log2amp(mode, nb_ebands, band_amp, &self.old_band_e, channels);
+            denormalise_bands(
+                mode,
+                x,
+                freq,
+                band_amp,
+                start_band,
+                end_band,
+                channels,
+                (1 << lm) as usize,
+            );
+            // Anti-aliasing: zero MDCT bins above the output Nyquist when
+            // downsampling (libopus denormalise_bands `if(downsample!=1)
+            // bound=IMIN(bound,N/downsample)`).
+            if self.downsample > 1 {
+                let bound = frame_size / self.downsample;
+                for c in 0..channels {
+                    for i in bound..frame_size {
+                        freq[c * frame_size + i] = 0.0;
+                    }
                 }
             }
         }
