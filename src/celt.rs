@@ -22,6 +22,8 @@ fn bits_to_bitrate(bits: i32, fs: i32, frame_size: i32) -> i32 {
     bits * (6 * fs / frame_size) / 6
 }
 
+const OPUS_BITRATE_MAX: i32 = -1;
+
 
 // --- Heap-free buffer capacity constants (all sized for the worst case:
 //     2 channels, 48 kHz, max frame). Runtime construction uses smaller logical
@@ -1739,7 +1741,7 @@ impl CeltEncoder {
             delayed_intra: 0.0,
             lsb_depth: 24,
             overlap_max: 0.0,
-            bitrate: 64000,
+            bitrate: OPUS_BITRATE_MAX,
             vbr: false,
             constrained_vbr: true,
             vbr_reservoir: 0,
@@ -2070,8 +2072,8 @@ impl CeltEncoder {
             rc.nbits_total += new_tell - cur_tell;
         }
         // General VBR max bound (libopus 1936-1961) - constrained VBR
-        if self.vbr && self.bitrate != 9728000 {
-            let vbr_rate = bitrate_to_bits(self.bitrate, 48000, frame_size as i32) << BITRES;
+        if self.vbr && self.bitrate != OPUS_BITRATE_MAX {
+            let vbr_rate = bitrate_to_bits(self.bitrate, mode.fs, frame_size as i32) << BITRES;
             let nb_available = nb_compressed_bytes.saturating_sub(nb_filled_bytes_initial);
             if self.constrained_vbr {
                 let vbr_bound = vbr_rate;
