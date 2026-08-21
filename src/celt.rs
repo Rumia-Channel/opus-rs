@@ -2173,8 +2173,8 @@ impl CeltEncoder {
             let nb_available = nb_compressed_bytes.saturating_sub(nb_filled_bytes_initial);
             if self.constrained_vbr {
                 let vbr_bound = vbr_rate;
-                let max_allowed = std::cmp::min(
-                    std::cmp::max(if tell_initial == 1 { 2 } else { 0 }, (vbr_rate + vbr_bound - self.vbr_reservoir) >> (BITRES + 3)),
+                let max_allowed = core::cmp::min(
+                    core::cmp::max(if tell_initial == 1 { 2 } else { 0 }, (vbr_rate + vbr_bound - self.vbr_reservoir) >> (BITRES + 3)),
                     nb_available as i32,
                 );
                 if (max_allowed as usize) < nb_available {
