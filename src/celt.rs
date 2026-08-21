@@ -1689,6 +1689,9 @@ fn dynalloc_analysis_simple(
     is_transient: bool,
     offsets: &mut [i32],
     cap: &[i32],
+    lsb_depth: i32,
+    vbr: bool,
+    constrained_vbr: bool,
 ) {
     offsets.fill(0);
     if effective_bytes < (30 + 5 * lm) {
@@ -1742,8 +1745,14 @@ fn dynalloc_analysis_simple(
             follower[base + end - 2] = follower[base + end - 2].max(r);
             follower[base + end - 1] = follower[base + end - 1].max(r);
         }
+        // Clamp to noise floor (float C: GCONST etc are no-ops)
+        for i in 0..end {
+            let log_n = if i < mode.log_n.len() { mode.log_n[i] as f32 } else { 0.0 };
+            let e_mean = if i < mode.e_means.len() { mode.e_means[i] } else { 0.0 };
+            let noise_floor = 0.0625 * log_n + 0.5 + (9 - lsb_depth) as f32 - e_mean + 0.0062 * ((i + 5) * (i + 5)) as f32;
+            follower[base + i] = follower[base + i].max(noise_floor);
+        }
     }
-
     if channels == 2 {
         for i in start..end {
             let l = follower[i];
@@ -1759,7 +1768,7 @@ fn dynalloc_analysis_simple(
         }
     }
 
-    if !is_transient {
+    if (!vbr || constrained_vbr) && !is_transient {
         for i in start..end {
             follower[i] *= 0.5;
         }
@@ -1787,11 +1796,13 @@ fn dynalloc_analysis_simple(
             (b, (b * 6) << BITRES)
         };
 
-        // Keep dynalloc bounded so allocator still has base bits in CBR usage.
-        let cap_bits = ((2 * effective_bytes as i32) / 3) << (BITRES + 3);
-        if tot_boost + boost_bits > cap_bits {
-            offsets[i] = ((cap_bits - tot_boost) >> BITRES).max(0);
-            break;
+        // Cap only for CBR / non-transient constrained VBR (libopus 1254-1257)
+        if (!vbr || (constrained_vbr && !is_transient)) {
+            let cap_bits = ((2 * effective_bytes as i32) / 3) << (BITRES + 3);
+            if tot_boost + boost_bits > cap_bits {
+                offsets[i] = ((cap_bits - tot_boost) >> BITRES).max(0);
+                break;
+            }
         }
 
         let quanta = (width << BITRES).min((6 << BITRES).max(width));
@@ -2381,6 +2392,9 @@ impl CeltEncoder {
             is_transient,
             offsets,
             cap,
+            self.lsb_depth,
+            self.vbr,
+            self.constrained_vbr,
         );
 
         let mut dynalloc_logp = 6i32;
