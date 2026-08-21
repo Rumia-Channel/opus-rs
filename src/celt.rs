@@ -1675,6 +1675,96 @@ fn median5(v: &[f32]) -> f32 {
     x[2]
 }
 
+// Port of celt_encoder.c tone_lpc / tone_detect (float path, no FIXED_POINT shifts)
+fn tone_lpc(x: &[f32], len: usize, delay: usize, lpc: &mut [f32; 2]) -> bool {
+    // returns true on fail
+    if len <= 2 * delay {
+        return true;
+    }
+    let mut r00 = 0.0f32;
+    let mut r01 = 0.0f32;
+    let mut r11 = 0.0f32;
+    let mut r02 = 0.0f32;
+    let mut r12 = 0.0f32;
+    let mut r22 = 0.0f32;
+    for i in 0..len - 2 * delay {
+        r00 += x[i] * x[i];
+        r01 += x[i] * x[i + delay];
+        r02 += x[i] * x[i + 2 * delay];
+    }
+    let mut edges = 0.0f32;
+    for i in 0..delay {
+        edges += x[len + i - 2 * delay] * x[len + i - 2 * delay] - x[i] * x[i];
+    }
+    r11 = r00 + edges;
+    edges = 0.0;
+    for i in 0..delay {
+        edges += x[len + i - delay] * x[len + i - delay] - x[i + delay] * x[i + delay];
+    }
+    r22 = r11 + edges;
+    edges = 0.0;
+    for i in 0..delay {
+        edges += x[len + i - 2 * delay] * x[len + i - delay] - x[i] * x[i + delay];
+    }
+    r12 = r01 + edges;
+    // Reverse and sum to get backward contribution (float: simple sums)
+    let (rr00, rr01, rr11, rr02, rr12, rr22) = (r00 + r22, r01 + r12, 2.0 * r11, 2.0 * r02, r12 + r01, r00 + r22);
+    r00 = rr00;
+    r01 = rr01;
+    r11 = rr11;
+    r02 = rr02;
+    r12 = rr12;
+    r22 = rr22;
+    let den = r00 * r11 - r01 * r01;
+    if den < 0.001 * r00 * r11 {
+        return true;
+    }
+    let mut lpc1 = (r02 * r11 - r01 * r12) / den;
+    let mut lpc0 = (r00 * r12 - r02 * r01) / den;
+    // Clamp as in C (Q29 limits)
+    lpc1 = lpc1.clamp(-1.0, 1.0);
+    lpc0 = lpc0.clamp(-1.999999, 1.999999);
+    // C does HALF check for lpc0, but float clamp suffices
+    lpc[0] = lpc0;
+    lpc[1] = lpc1;
+    false
+}
+
+fn tone_detect(in_buf: &[f32], cc: usize, n: usize, fs: i32) -> (f32, f32) {
+    // in_buf is at least N samples per channel, we use N = n (frame+overlap)
+    // For CC==2, average channels; for float, no shift scaling.
+    // Use FixedVec to stay no_std heap-free.
+    let mut x: FixedVec<f32, 2048> = FixedVec::from_value(0.0, n);
+    if cc == 2 {
+        for i in 0..n {
+            x[i] = 0.5 * (in_buf[i] + in_buf[i + n]);
+        }
+    } else {
+        for i in 0..n {
+            x[i] = in_buf[i];
+        }
+    }
+    let mut delay = 1usize;
+    let mut lpc = [0.0f32; 2];
+    let mut fail = tone_lpc(&x[..n], n, delay, &mut lpc);
+    while delay <= (fs as usize / 3000) && (fail || (lpc[0] > 1.0 && lpc[1] < 0.0)) {
+        delay *= 2;
+        fail = tone_lpc(&x[..n], n, delay, &mut lpc);
+    }
+    if !fail && lpc[0] * lpc[0] + 3.999999 * lpc[1] < 0.0 {
+        let toneishness = -lpc[1];
+        // acos needs libm in no_std
+        #[cfg(feature = "std")]
+        let freq = (0.5 * lpc[0]).acos() / delay as f32;
+        #[cfg(not(feature = "std"))]
+        let freq = crate::compat::Math::acos(0.5 * lpc[0]) / delay as f32;
+        (freq, toneishness)
+    } else {
+        (-1.0, 0.0)
+    }
+}
+
+
 #[allow(clippy::too_many_arguments)]
 fn dynalloc_analysis_simple(
     mode: &CeltMode,
@@ -1694,6 +1784,8 @@ fn dynalloc_analysis_simple(
     constrained_vbr: bool,
     analysis: &AnalysisInfo,
     surround_dynalloc: &[f32],
+    tone_freq: f32,
+    toneishness: f32,
 ) {
     offsets.fill(0);
     if effective_bytes < (30 + 5 * lm) {
@@ -1794,8 +1886,34 @@ fn dynalloc_analysis_simple(
             follower[i] *= 0.5;
         }
     }
-    // C 1206-1222 tone compensation requires tone_freq/toneishness (analysis-dependent) — deferred, structure kept
-    // if toneishness > 0.98 { boost around tone_freq }
+    // C 1206-1222: Compensate for Opus' under-allocation on tones
+    if toneishness > 0.98 {
+        let freq_bin = (tone_freq * 120.0 / core::f32::consts::PI + 0.5).floor() as i32;
+        for i in start..end {
+            let lo = mode.e_bands[i] as i32;
+            let hi = mode.e_bands[i + 1] as i32;
+            if freq_bin >= lo && freq_bin <= hi {
+                follower[i] += 2.0;
+            }
+            if freq_bin >= lo - 1 && freq_bin <= hi + 1 {
+                follower[i] += 1.0;
+            }
+            if freq_bin >= lo - 2 && freq_bin <= hi + 2 {
+                follower[i] += 1.0;
+            }
+            if freq_bin >= lo - 3 && freq_bin <= hi + 3 {
+                follower[i] += 0.5;
+            }
+        }
+        if freq_bin >= mode.e_bands[end] as i32 {
+            if end >= 1 {
+                follower[end - 1] += 2.0;
+            }
+            if end >= 2 {
+                follower[end - 2] += 1.0;
+            }
+        }
+    }
     if analysis.valid {
         // C 1226-1230: leak_boost
         for i in start..end.min(19) {
@@ -1809,7 +1927,7 @@ fn dynalloc_analysis_simple(
             follower[start] += add;
         }
     }
-    // TODO(deferred): tone compensation (1206-1222) requires toneishness plumbing
+
 
     let mut tot_boost = 0i32;
     for i in start..end {
@@ -2410,6 +2528,9 @@ impl CeltEncoder {
         } else {
             None
         };
+        // Tone detection for dynalloc (C 2022) — float path
+        // Use pcm deinterleaved buffer (channel-contiguous) as in libopus in=CC*N
+        let (tone_freq, toneishness) = tone_detect(pcm, channels, frame_size, mode.fs);
         // Surround masking dynalloc (C 2112-2140) — full computation requires energy_mask/hybrid logic,
         // currently zeroed as neutral input to dynalloc's MAX step (1182). Wired for future port.
         let surround_dynalloc = [0.0f32; 21];
@@ -2431,6 +2552,8 @@ impl CeltEncoder {
             self.constrained_vbr,
             &self.analysis,
             &surround_dynalloc,
+            tone_freq,
+            toneishness,
         );
 
         let mut dynalloc_logp = 6i32;
