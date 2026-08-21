@@ -515,11 +515,10 @@ impl OpusEncoder {
 
         // Cap at the Opus per-packet maximum (RFC 6716); the range coder's buffer
         // is heap-free and sized to this constant.
-        let n_bytes = cbr_bytes
+        let mut n_bytes = cbr_bytes
             .min(max_data_bytes)
             .max(1)
             .min(OPUS_MAX_PACKET_BYTES);
-
         let init_rc_size = n_bytes - 1;
         self.rc.reset_for_encode(init_rc_size as u32);
 
@@ -742,8 +741,24 @@ impl OpusEncoder {
             0
         };
 
+        // libopus parity: adjust nbCompressedBytes for CELT/Hybrid based on tell (opus_encoder.c:1913-1921)
+        // tmp = bitrate*frame_size + tell*Fs; nbCompressed = (tmp+4*Fs)/(8*Fs)
+        if mode != OpusMode::SilkOnly {
+            let tell = self.rc.tell();
+            if tell > 1 {
+                let tmp = self.bitrate_bps as i64 * frame_size as i64 + tell as i64 * self.sampling_rate as i64;
+                let adjusted = ((tmp + 4 * self.sampling_rate as i64) / (8 * self.sampling_rate as i64)) as usize;
+                let new_n = adjusted.min(max_data_bytes).max(1).min(OPUS_MAX_PACKET_BYTES);
+                if new_n < n_bytes {
+                    n_bytes = new_n;
+                    // shrink range coder to new size (keep SILK bytes, trim tail)
+                    let new_payload = n_bytes - 1;
+                    self.rc.shrink(new_payload as u32);
+                }
+            }
+        }
+
         if mode == OpusMode::CeltOnly || mode == OpusMode::Hybrid {
-            self.celt_enc.complexity = self.complexity;
             let start_band = if mode == OpusMode::Hybrid { 17 } else { 0 };
             let total_packet_bits = ((n_bytes - 1) * 8) as i32;
             // Propagate bitrate/VBR to CeltEncoder for accurate VBR handling (libopus parity)
