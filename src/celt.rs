@@ -97,6 +97,26 @@ fn compute_vbr(
     }
     target.min(2 * base_target)
 }
+const EMEANS_F: [f32; 25] = [
+    6.4375, 6.25, 5.75, 5.3125, 5.0625, 4.8125, 4.5, 4.375, 4.875, 4.6875, 4.5625, 4.4375, 4.875, 4.625,
+    4.3125, 4.5, 4.375, 4.625, 4.75, 4.4375, 3.75, 3.75, 3.75, 3.75, 3.75,
+];
+fn compute_max_depth(mode: &CeltMode, band_log_e: &[f32], nb_ebands: usize, c: usize, end: usize, lsb_depth: i32) -> f32 {
+    let mut max_depth: f32 = -31.9;
+    for ch in 0..c {
+        for i in 0..end {
+            let log_n = mode.log_n[i] as f32;
+            let e_mean = if i < EMEANS_F.len() { EMEANS_F[i] } else { 0.0 };
+            let noise_floor = 0.0625 * log_n + 0.5 + (9 - lsb_depth) as f32 - e_mean + 0.0062 * ((i + 5) * (i + 5)) as f32;
+            let v = band_log_e[ch * nb_ebands + i] - noise_floor;
+            if v > max_depth {
+                max_depth = v;
+            }
+        }
+    }
+    max_depth
+}
+
 
 
 
@@ -2429,7 +2449,7 @@ impl CeltEncoder {
                 }
             };
             // nbCompressedBytes is current max (after first VBR bound), effectiveBytes ~ vbr_rate>>(3+BITRES) for lambda already
-            let nb_compressed_bytes_i32 = nb_compressed_bytes as i32;
+            let max_depth = compute_max_depth(mode, band_log_e, nb_ebands, channels, nb_ebands, self.lsb_depth);
             let mut target = if !hybrid {
                 compute_vbr(
                     mode,
@@ -2445,7 +2465,7 @@ impl CeltEncoder {
                     tot_boost,
                     tf_estimate,
                     0, // pitch_change stub
-                    0.0, // maxDepth stub
+                    max_depth,
                     false,
                     false,
                     0.0,
