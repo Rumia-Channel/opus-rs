@@ -746,6 +746,19 @@ impl OpusEncoder {
             self.celt_enc.complexity = self.complexity;
             let start_band = if mode == OpusMode::Hybrid { 17 } else { 0 };
             let total_packet_bits = ((n_bytes - 1) * 8) as i32;
+            // Propagate bitrate/VBR to CeltEncoder for accurate VBR handling (libopus parity)
+            let celt_bitrate = if mode == OpusMode::Hybrid {
+                let frame_ms = frame_size as i32 * 1000 / self.sampling_rate;
+                let frame20ms = frame_ms >= 20;
+                let silk_rate = compute_silk_rate_for_hybrid(self.bitrate_bps, frame20ms);
+                (self.bitrate_bps - silk_rate).max(8000)
+            } else {
+                self.bitrate_bps
+            };
+            self.celt_enc.set_bitrate(celt_bitrate);
+            self.celt_enc.set_vbr(!self.use_cbr);
+            // libopus: Hybrid VBR is unconstrained (can steal from SILK), CELT-only constrained
+            self.celt_enc.set_constrained_vbr(mode == OpusMode::CeltOnly);
 
             let celt_input: &[f32] = if self.channels == 1 {
                 input

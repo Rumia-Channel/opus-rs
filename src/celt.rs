@@ -13,6 +13,15 @@ use crate::rate::{BITRES, clt_compute_allocation};
 #[cfg(not(feature = "std"))]
 use crate::compat::Math;
 use crate::fixedvec::FixedVec;
+#[inline]
+fn bitrate_to_bits(bitrate: i32, fs: i32, frame_size: i32) -> i32 {
+    bitrate * 6 / (6 * fs / frame_size)
+}
+#[inline]
+fn bits_to_bitrate(bits: i32, fs: i32, frame_size: i32) -> i32 {
+    bits * (6 * fs / frame_size) / 6
+}
+
 
 // --- Heap-free buffer capacity constants (all sized for the worst case:
 //     2 channels, 48 kHz, max frame). Runtime construction uses smaller logical
@@ -1415,6 +1424,15 @@ pub struct CeltEncoder {
     delayed_intra: f32,
     lsb_depth: i32,
     overlap_max: f32,
+    bitrate: i32,
+    vbr: bool,
+    constrained_vbr: bool,
+    vbr_reservoir: i32,
+    vbr_drift: i32,
+    vbr_offset: i32,
+    vbr_count: i32,
+    spec_avg: f32,
+    stereo_saving: f32,
 
     w_in_buf: FixedVec<f32, CELT_BUFSTRIDE>,
     w_freq: FixedVec<f32, CELT_W_FREQ>,
@@ -1721,6 +1739,15 @@ impl CeltEncoder {
             delayed_intra: 0.0,
             lsb_depth: 24,
             overlap_max: 0.0,
+            bitrate: 64000,
+            vbr: false,
+            constrained_vbr: true,
+            vbr_reservoir: 0,
+            vbr_drift: 0,
+            vbr_offset: 0,
+            vbr_count: 0,
+            spec_avg: 0.0,
+            stereo_saving: 0.0,
 
             w_in_buf: FixedVec::from_value(0.0, bufstride_x_ch),
             w_freq: FixedVec::from_value(0.0, frame_x_ch + 4),
@@ -1801,6 +1828,15 @@ impl CeltEncoder {
 
     pub fn get_lsb_depth(&self) -> i32 {
         self.lsb_depth
+    }
+    pub fn set_bitrate(&mut self, bitrate: i32) {
+        self.bitrate = bitrate;
+    }
+    pub fn set_vbr(&mut self, vbr: bool) {
+        self.vbr = vbr;
+    }
+    pub fn set_constrained_vbr(&mut self, cvbr: bool) {
+        self.constrained_vbr = cvbr;
     }
 
     fn encode_impl(
@@ -2032,6 +2068,24 @@ impl CeltEncoder {
             let cur_tell = rc.tell();
             let new_tell = (nb_compressed_bytes * 8) as i32;
             rc.nbits_total += new_tell - cur_tell;
+        }
+        // General VBR max bound (libopus 1936-1961) - constrained VBR
+        if self.vbr && self.bitrate != 9728000 {
+            let vbr_rate = bitrate_to_bits(self.bitrate, 48000, frame_size as i32) << BITRES;
+            let nb_available = nb_compressed_bytes.saturating_sub(nb_filled_bytes_initial);
+            if self.constrained_vbr {
+                let vbr_bound = vbr_rate;
+                let max_allowed = std::cmp::min(
+                    std::cmp::max(if tell_initial == 1 { 2 } else { 0 }, (vbr_rate + vbr_bound - self.vbr_reservoir) >> (BITRES + 3)),
+                    nb_available as i32,
+                );
+                if (max_allowed as usize) < nb_available {
+                    nb_compressed_bytes = nb_filled_bytes_initial + max_allowed as usize;
+                    total_bits = (nb_compressed_bytes * 8) as i32;
+                    rc.shrink(nb_compressed_bytes as u32);
+                }
+            }
+            // effectiveBytes would be vbr_rate>>(3+BITRES) for later lambda, but total_bits already reflects bound
         }
 
         if start_band == 0 && !silence && rc.tell() + 16 <= total_bits {
