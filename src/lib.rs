@@ -759,6 +759,7 @@ impl OpusEncoder {
         }
 
         if mode == OpusMode::CeltOnly || mode == OpusMode::Hybrid {
+            self.celt_enc.complexity = self.complexity;
             let start_band = if mode == OpusMode::Hybrid { 17 } else { 0 };
             let total_packet_bits = ((n_bytes - 1) * 8) as i32;
             // Propagate bitrate/VBR to CeltEncoder for accurate VBR handling (libopus parity)
