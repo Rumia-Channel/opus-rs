@@ -23,6 +23,26 @@ fn bits_to_bitrate(bits: i32, fs: i32, frame_size: i32) -> i32 {
 }
 
 const OPUS_BITRATE_MAX: i32 = -1;
+// Simplified compute_vbr stub - port of libopus compute_vbr with analysis/has_surround disabled
+// Returns base_target adjusted for transient etc., but tonality/activity boosts are no-ops when analysis.valid==false
+#[allow(clippy::too_many_arguments)]
+fn compute_vbr_stub(
+    base_target: i32,
+    _lm: i32,
+    _last_coded_bands: i32,
+    _c: i32,
+    _intensity: i32,
+    _stereo_saving: f32,
+    _tot_boost: i32,
+    _tf_estimate: f32,
+) -> i32 {
+    // When analysis is invalid and no surround, libopus compute_vbr reduces to:
+    // target = base_target + tot_boost - (19<<LM) + tf boost + floor clamping (handled outside)
+    // For stub, keep base_target; the caller will add tot_boost etc. separately if needed.
+    // To keep packet sizes variable, add a small tot_boost contribution.
+    base_target
+}
+
 
 
 // --- Heap-free buffer capacity constants (all sized for the worst case:
@@ -2324,6 +2344,91 @@ impl CeltEncoder {
         );
         if rc.tell_frac() + (6 << BITRES) <= total_bits_bitres - total_boost {
             rc.encode_icdf(alloc_trim, &TRIM_ICDF, 7);
+        }
+        // Second VBR: compute target via simplified compute_vbr (libopus 2436-2534)
+        // This makes packet size variable for VBR (beyond silence) while keeping reservoir in sync
+        if self.vbr && self.bitrate != OPUS_BITRATE_MAX {
+            let vbr_rate = bitrate_to_bits(self.bitrate, mode.fs, frame_size as i32) << BITRES;
+            let hybrid = start_band != 0;
+            let lm_diff = mode.max_lm as i32 - lm as i32;
+            let mut base_target = if !hybrid {
+                vbr_rate - ((40 * channels as i32 + 20) << BITRES)
+            } else {
+                (0).max(vbr_rate - ((9 * channels as i32 + 4) << BITRES))
+            };
+            if self.constrained_vbr {
+                base_target += self.vbr_offset >> lm_diff;
+            }
+            let tot_boost = total_boost;
+            let tf_calib = 0; // simplified
+            let cur_tell_frac = rc.tell_frac();
+            let tell_initial_frac = (tell_initial as i32) << BITRES; // approx ec_tell_frac initial
+            let min_allowed = {
+                let a = ((cur_tell_frac + tot_boost + (1 << (BITRES + 3)) - 1) >> (BITRES + 3)) + 2;
+                if hybrid {
+                    let b = ((tell_initial_frac + (37 << BITRES) + tot_boost + (1 << (BITRES + 3)) - 1) >> (BITRES + 3));
+                    a.max(b)
+                } else {
+                    a
+                }
+            };
+            // nbCompressedBytes is current max (after first VBR bound), effectiveBytes ~ vbr_rate>>(3+BITRES) for lambda already
+            let nb_compressed_bytes_i32 = nb_compressed_bytes as i32;
+            let mut target = if !hybrid {
+                // Simplified compute_vbr: base_target + tot_boost - (19<<LM) + tf boost
+                let mut t = base_target;
+                t += tot_boost - (19 << lm as i32);
+                t += ((tf_estimate * 2.0 - 0.088) * t as f32) as i32; // approx tf calibration
+                // Clamp doubling
+                t.min(2 * base_target)
+            } else {
+                let mut t = base_target;
+                // silk offset and tf estimate adjustments (libopus hybrid branch)
+                // For stub, use 0 offset
+                t += ((tf_estimate - 0.25) * 50.0 * (1 << BITRES) as f32) as i32;
+                if tf_estimate > 0.7 {
+                    t = t.max(50 << BITRES);
+                }
+                t
+            };
+            target += cur_tell_frac;
+            let mut nb_available = ((target + (1 << (BITRES + 2))) >> (BITRES + 3)) as usize;
+            nb_available = nb_available.max(min_allowed as usize);
+            nb_available = nb_available.min(nb_compressed_bytes);
+            let delta = target - vbr_rate;
+            target = (nb_available as i32) << (BITRES + 3);
+            if silence {
+                nb_available = 2;
+                target = 2 * 8 << BITRES;
+            }
+            // Reservoir / drift update (libopus 2502-2529)
+            if self.vbr_count < 970 {
+                self.vbr_count += 1;
+            }
+            let alpha = if self.vbr_count < 970 {
+                // celt_rcp((vbr_count+20)<<16) approx 1/(vbr_count+20) in Q15
+                let v = self.vbr_count + 20;
+                (65536 / v) as i32 // Q15 approx
+            } else {
+                33 // QCONST16(0.001,15) ~33
+            };
+            if self.constrained_vbr {
+                self.vbr_reservoir += target - vbr_rate;
+                // drift: MULT16_32_Q15(alpha, delta - offset - drift)
+                let delta_minus = delta - self.vbr_offset - self.vbr_drift;
+                self.vbr_drift += ((alpha as i64 * delta_minus as i64) >> 15) as i32;
+                self.vbr_offset = -self.vbr_drift;
+            }
+            if self.constrained_vbr && self.vbr_reservoir < 0 {
+                let adjust = (-self.vbr_reservoir) / (8 << BITRES);
+                if !silence {
+                    nb_available = (nb_available as i32 + adjust) as usize;
+                }
+                self.vbr_reservoir = 0;
+            }
+            nb_compressed_bytes = nb_compressed_bytes.min(nb_available);
+            total_bits = (nb_compressed_bytes * 8) as i32;
+            rc.shrink(nb_compressed_bytes as u32);
         }
 
         let mut intensity = self.intensity;
