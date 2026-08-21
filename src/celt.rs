@@ -1773,16 +1773,30 @@ fn dynalloc_analysis_simple(
             follower[i] *= 0.5;
         }
     }
+    // Band weighting before capping: C does scale-then-min(4) (celt_encoder.c 1198-1204 + 1239).
+    // Rust was min(4)-then-scale, which diverges for follower>2 in i<8 or >4 in i>=12.
+    for i in start..end {
+        if i < 8 {
+            follower[i] *= 2.0;
+        }
+        if i >= 12 {
+            follower[i] *= 0.5;
+        }
+    }
+    // effBytes>320 boost (C 1232) — trivial, kept
+    if effective_bytes > 320 {
+        let add = (1.5f32).min(1e-3 * (effective_bytes as f32 - 320.0));
+        if start < end {
+            follower[start] += add;
+        }
+    }
+    // TODO(deferred): surround_dynalloc MAX (1182-1183), importance (1184-1191),
+    // tone compensation (1206-1222), leak_boost (1226-1230) require analysis/toneishness
+    // plumbing not yet ported. Surround currently 0, importance unused for offsets.
 
     let mut tot_boost = 0i32;
     for i in start..end {
-        let mut f = follower[i].min(4.0);
-        if i < 8 {
-            f *= 2.0;
-        }
-        if i >= 12 {
-            f *= 0.5;
-        }
+        let f = follower[i].min(4.0);
 
         let width = channels as i32 * (mode.e_bands[i + 1] - mode.e_bands[i]) as i32 * (1 << lm);
         let (boost, boost_bits) = if width < 6 {
