@@ -46,12 +46,13 @@ fn oracle_celt_sine_48k_mono_64k() {
     assert!(c_n > 0 && c_n <= 1276);
     let diff = (rs_n as i32 - c_n as i32).abs();
     assert!(diff <= 5, "size diff too large rs {} vs c {} diff {}", rs_n, c_n, diff);
-    // Byte-exact for Rust's own 48k CELT output (regression vs fixture from current port).
-    // Old C (libopus 1.3 via audiopus_sys 0.2.2) differs due to tone/prefilter evolution, so we verify
-    // Rust's determinism and known prefix instead of strict C byte equality.
-    let expected_prefix: [u8; 8] = [0xf8, 0xb3, 0x3a, 0x7a, 0x2b, 0xec, 0x8e, 0x1b];
+    // Byte-exact regression for 48k mono 64k CBR sine, validated against a
+    // libopus 1.6.1-51-g03647f52 (float, x86 SSE2/AVX2) reference build. The
+    // audiopus_sys 0.2.2 C (libopus 1.3) differs in tone/prefilter evolution,
+    // so we assert the 1.6 fixture here and only require size proximity vs 1.3.
+    let expected_prefix: [u8; 8] = [0xf8, 0x7b, 0x5e, 0x09, 0x50, 0xb7, 0x8c, 0x08];
     assert_eq!(&rs_buf[..8.min(rs_n)], &expected_prefix[..8.min(rs_n)], "byte prefix mismatch for 48k sine 64k");
-    const EXPECTED_SINE_HEX: &str = "f8b33a7a2bec8e1bdeb7af5777649e182697436b1a099692a835dea050592c7aa969369667d6dfd72528a9f66009b3bdc520e502f960bec9b2448c4fc64a7e0d4186d6a5c2f26260da2bc4b796bb70e7dc32be08bb581bb30d0bda179d96c5d3b6bb8a6fb3fbae5b2f4c018c7b95211cf6334bdb785540fa8c6edf26491844025f11d4926d5c7dfbdfa35358a0f3975230d3f8331282cb8f09dbc155c2020dae";
+    const EXPECTED_SINE_HEX: &str = "f87b5e0950b78c08d0bbae9ae1d725a72fe5ee25c2740398a4615b113822973b042c80fdb66da4a3a2cb9c192af55d6bf6dd65c5c7653367144ecc6b0565efad221c5de2215ab8fc6f9f4f48cad42d1c1999da21cfa221cfa037aa44b81ad91d4a8d1d581540cf6c39176eeab2770f00b461d43fa328ae650837e79c9e8f6c417951dc2e4d32634de493b88e0d167016e2646590e686571dcf2104af43ab137d";
     let expected = hex_to_bytes(EXPECTED_SINE_HEX);
     assert_eq!(rs_n, expected.len(), "fixture len mismatch for 48k sine");
     assert_eq!(&rs_buf[..rs_n], &expected[..], "full byte-exact mismatch for 48k sine 64k");
@@ -95,10 +96,14 @@ fn oracle_impulse_48k_mono_64k() {
     assert!(max < 15.0 && max.is_finite());
     // For 48k CBR, also check byte closeness (allow small divergence due to remaining tone/Hybrid gaps)
     assert!((rs_n as i32 - c_n as i32).abs() <= 5);
-    // Byte-exact for Rust's own 48k impulse (regression)
-    let expected_impulse_prefix: [u8; 8] = [0xf8, 0x7f, 0x7d, 0x04, 0x38, 0x05, 0x2a, 0x21];
+    // Byte-exact for Rust's own 48k impulse (regression). The first 7 bytes match
+    // a libopus 1.6.1 reference build; byte 7+ diverges from 1.6 because the Rust
+    // port does not run libopus' tonality analysis (analysis.c), which nudges
+    // alloc_trim via tonality_slope (C trim=1 vs Rust trim=0 here). This fixture
+    // freezes the current deterministic output.
+    let expected_impulse_prefix: [u8; 8] = [0xf8, 0x73, 0x46, 0xb9, 0xc0, 0x16, 0x58, 0x58];
     assert_eq!(&rs_buf[..8.min(rs_n)], &expected_impulse_prefix[..8.min(rs_n)], "byte prefix mismatch for 48k impulse");
-    const EXPECTED_IMPULSE_HEX: &str = "f87f7d0438052a212201282ac860c1888ac2a4220abeb23e0ab217c0a5711a31259a499a51a065b87a7bb247a10c297fba1169527fd742fb32cd0b54f6342c0c00daaf19bec71d433d353671d7e53a442267df33e6da7a8af01aeade58265a84ccc96cc961d342ae77d60b85d4ac4b5588eac4b5e51ac6832f7f82f1ac80415213aa2a8a7a023f0c15d0b1f6888da4aabe0f0e370e2b1e24d6c7d8d10074d6d1";
+    const EXPECTED_IMPULSE_HEX: &str = "f87346b9c0165858f73144258b8b79c2179a4272570325a2d263ab6067bb993375941787ac6e1904601599cafeb058f8eeb514adbb22ecb11412d9d75cf1169fdb36a4d7a7d06817cffc23fd39b6e3e7829db5edf6ed58cb3f58cb3f6a03976a5e05ee0ba8221ad585de11653bfacdcab607c26370d5f7945c3ca511ba07ffb4d8ff77d0c3d7e883f06d09b55d8db6a05ad7119fb82d72fb7375ccb483588e35";
     let expected = hex_to_bytes(EXPECTED_IMPULSE_HEX);
     assert_eq!(rs_n, expected.len(), "fixture len mismatch for impulse");
     assert_eq!(&rs_buf[..rs_n], &expected[..], "full byte-exact mismatch for impulse");

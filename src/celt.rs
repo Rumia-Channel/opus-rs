@@ -333,7 +333,8 @@ fn transient_analysis(
         mem0 = 0.0f32;
         for i in 0..len2 {
             let x2 = (tmp[2 * i] * tmp[2 * i] + tmp[2 * i + 1] * tmp[2 * i + 1]) / 16.0;
-            mean += x2 / 4096.0;
+            // C float build: PSHR32(x2, 12) is an identity, so mean += x2
+            mean += x2;
             mem0 = x2 + (1.0 - forward_decay) * mem0;
             tmp2[i] = forward_decay * mem0;
         }
@@ -349,19 +350,22 @@ fn transient_analysis(
         }
 
         mean = (mean * max_e * 0.5 * (len2 as f32)).sqrt();
-        let norm = (len2 as f32) / (1e-10 + mean);
+        // C (float build): norm = len2 / (EPSILON + mean)  [EPSILON = 1e-15f]
+        let norm = (len2 as f32) / (1e-15 + mean);
 
-        let mut unmask = 0.0f32;
+        // C computes the harmonic mean with INTEGER arithmetic (mask_metric and
+        // unmask are opus_int32; the 64/6 scaling is an integer division).
+        let mut unmask: i32 = 0;
         for i in (12..(len2 - 5)).step_by(4) {
-            let id = (64.0 * norm * (tmp2[i] + 1e-10)).floor() as i32;
+            let id = (64.0 * norm * (tmp2[i] + 1e-15)).floor() as i32;
             let id = id.clamp(0, 127) as usize;
-            unmask += INV_TABLE[id] as f32;
+            unmask += INV_TABLE[id] as i32;
         }
 
-        unmask = 64.0 * unmask * 4.0 / (6.0 * (len2 as f32 - 17.0));
-        if unmask > mask_metric {
+        unmask = 64 * unmask * 4 / (6 * (len2 as i32 - 17));
+        if (unmask as f32) > mask_metric {
             *tf_chan = c;
-            mask_metric = unmask;
+            mask_metric = unmask as f32;
         }
     }
 
@@ -372,7 +376,10 @@ fn transient_analysis(
         mask_metric = 0.0;
     }
 
-    *tf_estimate = (mask_metric - 150.0).clamp(0.0, 1.0);
+    // C (celt_encoder.c:460-461): tf_max = max(0, sqrt(27*mask_metric) - 42);
+    // tf_estimate = sqrt(max(0, 0.0069*min(163, tf_max) - 0.139))  [float build]
+    let tf_max = ((27.0 * mask_metric).sqrt() - 42.0).max(0.0);
+    *tf_estimate = (0.0069 * tf_max.min(163.0) - 0.139).max(0.0).sqrt();
 
     is_transient
 }
@@ -501,6 +508,7 @@ fn tf_analysis(
     lm: i32,
     tf_estimate: f32,
     tf_chan: usize,
+    importance: &[i32],
 ) -> i32 {
     debug_assert!(len <= MAX_NB_EBANDS);
     let mut metric = [0i32; MAX_NB_EBANDS];
@@ -553,80 +561,98 @@ fn tf_analysis(
     }
 
     let mut tf_select = 0;
-    let importance = [1.0f32; MAX_NB_EBANDS];
-    let mut selcost = [0.0f32; 2];
+    let mut selcost = [0i32; 2];
 
     for sel in 0..2 {
         let mut cost0 = importance[0]
-            * ((metric[0]
+            * (metric[0]
                 - 2 * TF_SELECT_TABLE[lm as usize][4 * (is_transient as usize) + 2 * sel] as i32)
-                as f32)
                 .abs();
         let mut cost1 = importance[0]
-            * ((metric[0]
+            * (metric[0]
                 - 2 * TF_SELECT_TABLE[lm as usize][4 * (is_transient as usize) + 2 * sel + 1]
-                    as i32) as f32)
+                    as i32)
                 .abs()
-            + (if is_transient { 0.0 } else { lambda as f32 });
+            + if is_transient { 0 } else { lambda };
 
         for i in 1..len {
-            let curr0 = cost0.min(cost1 + lambda as f32);
-            let curr1 = (cost0 + lambda as f32).min(cost1);
+            let curr0 = cost0.min(cost1 + lambda);
+            let curr1 = (cost0 + lambda).min(cost1);
             cost0 = curr0
                 + importance[i]
-                    * ((metric[i]
-                        - 2 * TF_SELECT_TABLE[lm as usize][4 * (is_transient as usize) + 2 * sel]
-                            as i32) as f32)
+                    * (metric[i]
+                        - 2 * TF_SELECT_TABLE[lm as usize]
+                            [4 * (is_transient as usize) + 2 * sel]
+                            as i32)
                         .abs();
             cost1 = curr1
                 + importance[i]
-                    * ((metric[i]
+                    * (metric[i]
                         - 2 * TF_SELECT_TABLE[lm as usize]
                             [4 * (is_transient as usize) + 2 * sel + 1]
-                            as i32) as f32)
+                            as i32)
                         .abs();
         }
         selcost[sel] = cost0.min(cost1);
     }
 
-    if selcost[1] < selcost[0] {
+    // C: only allow tf_select=1 for transients (celt_encoder.c:787)
+    if selcost[1] < selcost[0] && is_transient {
         tf_select = 1;
     }
 
+    // Viterbi forward pass with path storage, then backward pass to
+    // reconstruct the optimal tf_res (C celt_encoder.c:789-822).
+    let sel = tf_select as usize;
     let mut cost0 = importance[0]
-        * ((metric[0]
-            - 2 * TF_SELECT_TABLE[lm as usize][4 * (is_transient as usize) + 2 * tf_select] as i32)
-            as f32)
+        * (metric[0] - 2 * TF_SELECT_TABLE[lm as usize][4 * (is_transient as usize) + 2 * sel] as i32)
             .abs();
     let mut cost1 = importance[0]
-        * ((metric[0]
-            - 2 * TF_SELECT_TABLE[lm as usize][4 * (is_transient as usize) + 2 * tf_select + 1]
-                as i32) as f32)
+        * (metric[0]
+            - 2 * TF_SELECT_TABLE[lm as usize][4 * (is_transient as usize) + 2 * sel + 1] as i32)
             .abs()
-        + (if is_transient { 0.0 } else { lambda as f32 });
+        + if is_transient { 0 } else { lambda };
 
-    tf_res[0] = if cost0 < cost1 { 0 } else { 1 };
-
+    let mut path0 = [0i32; MAX_NB_EBANDS];
+    let mut path1 = [0i32; MAX_NB_EBANDS];
     for i in 1..len {
-        let curr0 = cost0.min(cost1 + lambda as f32);
-        let curr1 = (cost0 + lambda as f32).min(cost1);
+        let from0 = cost0;
+        let from1 = cost1 + lambda;
+        let curr0 = if from0 < from1 {
+            path0[i] = 0;
+            from0
+        } else {
+            path0[i] = 1;
+            from1
+        };
+
+        let from0 = cost0 + lambda;
+        let from1 = cost1;
+        let curr1 = if from0 < from1 {
+            path1[i] = 0;
+            from0
+        } else {
+            path1[i] = 1;
+            from1
+        };
+
         cost0 = curr0
             + importance[i]
-                * ((metric[i]
-                    - 2 * TF_SELECT_TABLE[lm as usize][4 * (is_transient as usize) + 2 * tf_select]
-                        as i32) as f32)
+                * (metric[i] - 2 * TF_SELECT_TABLE[lm as usize][4 * (is_transient as usize) + 2 * sel] as i32)
                     .abs();
         cost1 = curr1
             + importance[i]
-                * ((metric[i]
-                    - 2 * TF_SELECT_TABLE[lm as usize]
-                        [4 * (is_transient as usize) + 2 * tf_select + 1]
-                        as i32) as f32)
+                * (metric[i]
+                    - 2 * TF_SELECT_TABLE[lm as usize][4 * (is_transient as usize) + 2 * sel + 1]
+                        as i32)
                     .abs();
-        tf_res[i] = if cost0 < cost1 { 0 } else { 1 };
+    }
+    tf_res[len - 1] = if cost0 < cost1 { 0 } else { 1 };
+    for i in (0..len - 1).rev() {
+        tf_res[i] = if tf_res[i + 1] == 1 { path1[i + 1] } else { path0[i + 1] };
     }
 
-    tf_select as i32
+    tf_select
 }
 
 fn tf_encode(
@@ -1308,6 +1334,11 @@ fn run_prefilter(
 
     analysis: &AnalysisInfo,
     loss_rate: i32,
+    tf_estimate: f32,
+    nb_available_bytes: usize,
+    tone_freq: f32,
+    toneishness: f32,
+    complexity: i32,
 ) -> (bool, f32, usize) {
     let max_period = COMBFILTER_MAXPERIOD;
     let min_period = COMBFILTER_MINPERIOD;
@@ -1322,50 +1353,90 @@ fn run_prefilter(
         );
     }
 
-    let pitch_buf_len = (max_period + frame_size) >> 1;
-    {
-        let mut pre_slices: FixedVec<&[f32], 2> = FixedVec::new();
-        for c in 0..channels {
-            pre_slices.push(&pre[c * pre_size..c * pre_size + pre_size]);
+    let enabled = true;
+    let mut pitch_index = COMBFILTER_MINPERIOD;
+    let mut gain1 = 0.0f32;
+    if enabled && toneishness > 0.99 {
+        // Tone path (C 1449-1473): bypass the pitch search for pure tones.
+        let mut multiple = 1.0f32;
+        let mut tone_freq = tone_freq;
+        if tone_freq >= 3.1416 {
+            tone_freq = 3.141593 - tone_freq;
         }
-        crate::pitch::pitch_downsample(&pre_slices, pitch_buf, pitch_buf_len, channels, 2);
+        while tone_freq >= multiple * 0.39 {
+            multiple += 1.0;
+        }
+        if tone_freq > 0.006148 {
+            pitch_index = ((0.5 + 2.0 * core::f32::consts::PI * multiple / tone_freq) as usize)
+                .min(COMBFILTER_MAXPERIOD - 2);
+        } else {
+            pitch_index = COMBFILTER_MINPERIOD;
+        }
+        gain1 = 0.75;
+    } else if enabled && complexity >= 5 {
+        let pitch_buf_len = (max_period + frame_size) >> 1;
+        {
+            let mut pre_slices: FixedVec<&[f32], 2> = FixedVec::new();
+            for c in 0..channels {
+                pre_slices.push(&pre[c * pre_size..c * pre_size + pre_size]);
+            }
+            crate::pitch::pitch_downsample(&pre_slices, pitch_buf, pitch_buf_len, channels, 2);
+        }
+
+        let search_max = max_period - 3 * min_period;
+        let pitch_result = crate::pitch::pitch_search(
+            &pitch_buf[max_period >> 1..],
+            pitch_buf,
+            frame_size,
+            search_max,
+        );
+        pitch_index = (max_period - pitch_result).min(max_period - 2);
+
+        gain1 = crate::pitch::remove_doubling(
+            pitch_buf,
+            max_period,
+            min_period,
+            frame_size,
+            &mut pitch_index,
+            prefilter_period,
+            prefilter_gain,
+        );
+        if pitch_index > max_period - 2 {
+            pitch_index = max_period - 2;
+        }
+        gain1 *= 0.7;
+        // C: halve at >2% loss, halve again at >4%, zero at >8%
+        if loss_rate > 2 {
+            gain1 *= 0.5;
+        }
+        if loss_rate > 4 {
+            gain1 *= 0.5;
+        }
+        if loss_rate > 8 {
+            gain1 = 0.0;
+        }
+    } else {
+        gain1 = 0.0;
+        pitch_index = COMBFILTER_MINPERIOD;
     }
 
-    let search_max = max_period - 3 * min_period;
-    let pitch_result = crate::pitch::pitch_search(
-        &pitch_buf[max_period >> 1..],
-        pitch_buf,
-        frame_size,
-        search_max,
-    );
-    let mut pitch_index = (max_period - pitch_result).min(max_period - 2);
-
-    let gain1_raw = crate::pitch::remove_doubling(
-        pitch_buf,
-        max_period,
-        min_period,
-        frame_size,
-        &mut pitch_index,
-        prefilter_period,
-        prefilter_gain,
-    );
-    let mut gain1 = gain1_raw * 0.7;
-
-    // Apply max_pitch_ratio from analysis if available
     if analysis.valid {
         gain1 *= analysis.max_pitch_ratio;
-    }
-
-    // Apply loss_rate scaling: halve at 2%, quarter at 4%, zero at 8%
-    if loss_rate >= 8 {
-        gain1 = 0.0;
-    } else if loss_rate > 0 {
-        gain1 *= 1.0 - (loss_rate as f32) / 8.0;
     }
 
     let mut pf_threshold = 0.2f32;
     if (pitch_index as i32 - prefilter_period as i32).unsigned_abs() as usize * 10 > pitch_index {
         pf_threshold += 0.2;
+        // Completely disable the prefilter on strong transients without continuity.
+        if tf_estimate > 0.98 {
+            gain1 = 0.0;
+        }
+    }
+    if nb_available_bytes < 25 {
+        pf_threshold += 0.1;
+    }
+    if nb_available_bytes < 35 {
+        pf_threshold += 0.1;
     }
     if prefilter_gain > 0.4 {
         pf_threshold -= 0.1;
@@ -1786,9 +1857,13 @@ fn dynalloc_analysis_simple(
     surround_dynalloc: &[f32],
     tone_freq: f32,
     toneishness: f32,
+    importance: &mut [i32],
 ) {
     offsets.fill(0);
     if effective_bytes < (30 + 5 * lm) {
+        for v in importance.iter_mut() {
+            *v = 13;
+        }
         return;
     }
 
@@ -1865,11 +1940,10 @@ fn dynalloc_analysis_simple(
         // C 1182-1183: follower = max(follower, surround_dynalloc)
         follower[i] = follower[i].max(surround_dynalloc[i]);
     }
-    // C 1184-1191: importance = floor(0.5+13*exp2(min(follower,4))) — kept for fidelity, not used for offsets
-    let mut _importance_tmp = [13i32; 21];
+    // C 1184-1191: importance = floor(0.5+13*exp2(min(follower,4)))
     for i in start..end {
         let v = follower[i].min(4.0);
-        _importance_tmp[i] = (0.5 + 13.0 * (2.0f32).powf(v)).floor() as i32;
+        importance[i] = (0.5 + 13.0 * (2.0f32).powf(v)).floor() as i32;
     }
     if (!vbr || constrained_vbr) && !is_transient {
         for i in start..end {
@@ -2203,6 +2277,10 @@ impl CeltEncoder {
  let pf_enabled =
  start_band == 0 && self.complexity >= 5 && analysis_toneishness < 0.99 && channels == 1;
         let (pf_on, gain1, pitch_index) = if pf_enabled {
+            let tell = rc.tell();
+            let nb_filled = ((tell + 4) >> 3).max(0) as usize;
+            let total = explicit_total_bits.unwrap_or_else(|| (rc.buf.len() * 8) as i32);
+            let nb_available = ((total / 8) as usize).saturating_sub(nb_filled);
             run_prefilter(
                 in_buf,
                 &mut self.prefilter_mem,
@@ -2220,6 +2298,11 @@ impl CeltEncoder {
                 &mut self.w_prefilter_after,
                 &self.analysis,
                 self.loss_rate,
+                tf_estimate,
+                nb_available,
+                tone_freq,
+                toneishness,
+                self.complexity,
             )
         } else {
             (false, 0.0f32, COMBFILTER_MINPERIOD)
@@ -2274,6 +2357,8 @@ impl CeltEncoder {
         }
         let threshold = 1.0 / ((1 << self.lsb_depth) as f32);
         let mut silence = sample_max <= threshold;
+        if frame_size == 960 && channels == 2 {
+        }
         let tell_initial = rc.tell();
         let tell_initial_frac = rc.tell_frac();
         let nb_filled_bytes_initial = ((tell_initial + 4) >> 3).max(0) as usize;
@@ -2423,6 +2508,7 @@ impl CeltEncoder {
                 .iter()
                 .all(|&e| e <= -27.0)
         };
+        let _ = intra_ener; // C st->force_intra is used instead (CTL flag, 0 by default)
         quant_coarse_energy_advanced(
             mode,
             start_band,
@@ -2436,7 +2522,7 @@ impl CeltEncoder {
             channels,
             lm,
             (total_bits / 8) as usize,
-            is_transient || intra_ener,
+            false, // force_intra: C st->force_intra (CTL flag, 0 by default)
             &mut self.delayed_intra,
             self.complexity >= 4,
             0,
@@ -2446,6 +2532,51 @@ impl CeltEncoder {
         let tf_res = &mut self.w_tf_res[..nb_ebands];
         let effective_bytes = ((total_bits / 8) as usize).max(1);
         let lambda = 80.max(20480 / effective_bytes + 2) as i32;
+
+        // C runs dynalloc_analysis before tf_analysis: it produces `importance`
+        // (used by the tf Viterbi) and `offsets` (encoded later, after spread).
+        self.w_cap[..nb_ebands].fill(0);
+        let cap = &mut self.w_cap[..nb_ebands];
+        for (i, cap_i) in cap.iter_mut().enumerate() {
+            let n = (mode.e_bands[i + 1] - mode.e_bands[i]) << lm;
+            *cap_i = ((mode.cache.caps[nb_ebands * (2 * lm + channels - 1) + i] as i32 + 64)
+                * channels as i32
+                * n as i32)
+                >> 2;
+        }
+
+        self.w_offsets[..nb_ebands].fill(0);
+        let offsets = &mut self.w_offsets[..nb_ebands];
+
+        let band_log_e2_opt = if second_mdct {
+            Some(&self.w_band_log_e2[..nb_ebands * channels] as &[f32])
+        } else {
+            None
+        };
+        let surround_dynalloc = [0.0f32; 21];
+        let mut importance = [13i32; MAX_NB_EBANDS];
+        dynalloc_analysis_simple(
+            mode,
+            band_log_e,
+            band_log_e2_opt,
+            &self.old_band_e,
+            start_band,
+            nb_ebands,
+            channels,
+            lm,
+            effective_bytes,
+            is_transient,
+            offsets,
+            cap,
+            self.lsb_depth,
+            self.vbr,
+            self.constrained_vbr,
+            &self.analysis,
+            &surround_dynalloc,
+            tone_freq,
+            toneishness,
+            &mut importance,
+        );
 
         let tf_select = if self.complexity >= 2 && effective_bytes >= 15 * channels {
             tf_analysis(
@@ -2459,6 +2590,7 @@ impl CeltEncoder {
                 lm as i32,
                 tf_estimate,
                 tf_chan,
+                &importance,
             )
         } else {
             0
@@ -2520,51 +2652,6 @@ impl CeltEncoder {
         } else {
             self.spread_decision = SPREAD_NORMAL;
         }
-
-        self.w_cap[..nb_ebands].fill(0);
-        let cap = &mut self.w_cap[..nb_ebands];
-        for (i, cap_i) in cap.iter_mut().enumerate() {
-            let n = (mode.e_bands[i + 1] - mode.e_bands[i]) << lm;
-            *cap_i = ((mode.cache.caps[nb_ebands * (2 * lm + channels - 1) + i] as i32 + 64)
-                * channels as i32
-                * n as i32)
-                >> 2;
-        }
-
-        self.w_offsets[..nb_ebands].fill(0);
-        let offsets = &mut self.w_offsets[..nb_ebands];
-
-        let band_log_e2_opt = if second_mdct {
-            Some(&self.w_band_log_e2[..nb_ebands * channels] as &[f32])
-        } else {
-            None
-        };
- // Tone detection already computed earlier (C 2022) using in_buf with N+overlap and clamped with tf_estimate
- // Reuse tone_freq/toneishness from above; do not recompute with pcm/N
-        // Surround masking dynalloc (C 2112-2140) — full computation requires energy_mask/hybrid logic,
-        // currently zeroed as neutral input to dynalloc's MAX step (1182). Wired for future port.
-        let surround_dynalloc = [0.0f32; 21];
-        dynalloc_analysis_simple(
-            mode,
-            band_log_e,
-            band_log_e2_opt,
-            &self.old_band_e,
-            start_band,
-            nb_ebands,
-            channels,
-            lm,
-            effective_bytes,
-            is_transient,
-            offsets,
-            cap,
-            self.lsb_depth,
-            self.vbr,
-            self.constrained_vbr,
-            &self.analysis,
-            &surround_dynalloc,
-            tone_freq,
-            toneishness,
-        );
 
         let mut dynalloc_logp = 6i32;
         let total_bits_bitres = total_bits << BITRES;
@@ -2734,6 +2821,20 @@ impl CeltEncoder {
         let ebits = &mut self.w_ebits[..ebands_stereo];
         let mut balance = 0;
 
+        // C: bits = packet_bits - tell - 1; then subtract anti_collapse_rsv
+        // (celt_encoder.c:2614-2618) BEFORE the allocation.
+        let mut alloc_bits = (total_bits << BITRES) - rc.tell_frac() - 1;
+        let anti_collapse_rsv = if is_transient && lm >= 2 {
+            if alloc_bits >= ((lm as i32 + 2) << BITRES) {
+                1i32 << BITRES
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        alloc_bits -= anti_collapse_rsv;
+
         self.last_coded_bands = clt_compute_allocation(
             mode,
             start_band,
@@ -2743,7 +2844,7 @@ impl CeltEncoder {
             alloc_trim,
             &mut intensity,
             &mut dual_stereo_val,
-            (total_bits << BITRES) - rc.tell_frac() - 1,
+            alloc_bits,
             &mut balance,
             pulses,
             ebits,
@@ -2771,17 +2872,6 @@ impl CeltEncoder {
         let collapse_masks = &mut self.w_collapse_masks[..nb_ebands * channels];
         let (x_split, y_split) = x.split_at_mut(frame_size);
         let y_opt = if channels == 2 { Some(y_split) } else { None };
-
-        let anti_collapse_rsv = if is_transient && lm >= 2 {
-            let remaining = (total_bits << BITRES) - rc.tell_frac() - 1;
-            if remaining >= ((lm as i32 + 2) << BITRES) {
-                1i32 << BITRES
-            } else {
-                0
-            }
-        } else {
-            0
-        };
 
         let mut dual_stereo = dual_stereo_val != 0;
 

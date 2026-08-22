@@ -6,7 +6,12 @@ fn max_abs(v: &[f32]) -> f32 {
 
 #[test]
 fn vbr_near_silence_192k_not_huge() {
-    // PCM that previously generated fc 7f fd f8 and decoded to ~1.7e5 in libopus
+    // PCM that previously generated fc 7f fd f8 and decoded to ~1.7e5 in libopus.
+    // With the C-faithful delay ring + dc_reject the near-silence is not treated
+    // as digital silence, so the VBR packet is large (fc 7f fd padding header),
+    // but it must decode back to near-silence without a burst. (libopus 1.6 also
+    // emits a large fc-prefixed VBR packet here; its target is ~766 bytes while
+    // the Rust's simplified compute_vbr targets ~480 — a known VBR gap.)
     let frame_size = 960;
     let channels = 2;
     let mut pcm = vec![0.0f32; frame_size * channels];
@@ -21,8 +26,7 @@ fn vbr_near_silence_192k_not_huge() {
     enc.use_cbr = false;
     let mut out = vec![0u8; 1276];
     let n = enc.encode(&pcm, frame_size, &mut out).unwrap();
-    // must not be the old huge prefix
-    assert_ne!(&out[..3.min(n)], &[0xfc, 0x7f, 0xfd], "packet still has huge prefix fc 7f fd");
+    assert!(n > 0 && n <= 1276);
     let mut dec = OpusDecoder::new(48000, channels).unwrap();
     let mut pcm_out = vec![0.0f32; frame_size * channels];
     let decoded = dec.decode(&out[..n], frame_size, &mut pcm_out).unwrap();
